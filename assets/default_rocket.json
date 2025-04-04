@@ -1,0 +1,23 @@
+{
+    "name": "Default Stack",
+    "parts": [
+        {
+            "part_id": "pod_mk1",
+            "pos_x": 0.0,
+            "pos_y": 0.0,
+            "angle": 0
+        },
+        {
+            "part_id": "tank_small",
+            "pos_x": 0.0,
+            "pos_y": 32.5,
+            "angle": 0
+        },
+        {
+            "part_id": "engine_basic",
+            "pos_x": 0.0,
+            "pos_y": 62.5,
+            "angle": 0
+        }
+    ]
+}
