@@ -3,7 +3,6 @@ import json
 import pygame
 from parts import get_part_data  # Import the function to access part details
 
-
 class PlacedPart:
     def __init__(self, part_id, position, angle=0, connections=None):
         self.part_id = part_id  # e.g., "pod_mk1"
@@ -39,14 +38,11 @@ class PlacedPart:
 class RocketBlueprint:
     def __init__(self, name="My Rocket"):
         self.name = name
-        self.parts = []  # List of PlacedPart objects
+        self.parts = [] # List of PlacedPart objects
 
     def add_part(self, part_id, position, angle=0):
-        # In a real builder, position/angle would be calculated based on attachment
         placed_part = PlacedPart(part_id, position, angle)
         self.parts.append(placed_part)
-        # Need logic to manage the root part, connections etc.
-        # For now, assume the first part added is the root at (0,0)
 
     def get_total_mass(self):
         # Ignores fuel mass for now
@@ -62,6 +58,38 @@ class RocketBlueprint:
         return sum(p.part_data.get("fuel_capacity", 0) for p in self.parts)
 
     # Add methods for center of mass, total thrust, drawing the blueprint etc. later
+    def get_lowest_point_offset_y(self) -> float:
+            """
+            Calculates the Y-offset of the lowest point of the rocket assembly
+            relative to the root part's origin (0,0).
+            Assumes angle 0 for all parts for simplicity in this calculation.
+            Returns 0 if no parts exist.
+            """
+            if not self.parts:
+                return 0.0
+
+            max_y_offset = -float('inf')  # Initialize to a very small number
+
+            for part in self.parts:
+                part_data = part.part_data
+                part_relative_center_y = part.relative_pos.y
+                part_half_height = part_data.get('height', 0) / 2.0
+
+                # Calculate the Y-coordinate of the bottom edge of this part relative to the root origin
+                part_bottom_y = part_relative_center_y + part_half_height
+
+                # Keep track of the maximum Y value found so far
+                max_y_offset = max(max_y_offset, part_bottom_y)
+
+            # If somehow no parts had positive height, default to 0? Should use root bottom.
+            if max_y_offset == -float('inf'):
+                if self.parts:  # If parts exist but calculation failed, use root part's bottom
+                    root_part = self.parts[0]
+                    return root_part.relative_pos.y + root_part.part_data.get('height', 0) / 2.0
+                else:
+                    return 0.0  # No parts, offset is 0
+
+            return max_y_offset
 
     def save_to_json(self, filename):
         data = {
