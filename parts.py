@@ -5,31 +5,37 @@ import pygame
 PART_TYPES = ["CommandPod", "FuelTank", "Engine", "Parachute", "Separator"]
 
 PARTS_CATALOG = {
+    # ... (pod_mk1) ...
     "pod_mk1": {
         "name": "Mk1 Command Pod", "type": "CommandPod", "mass": 50,
         "width": 20, "height": 25, "color": (200, 200, 200),
         "max_hp": 200,
-        # Define attachment areas/rules instead of points for grid builder
         "attachment_rules": {
-            "top_center": {"allowed_types": ["Parachute"]}, # Can attach parachute here
-            "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]} # Can attach stack parts below
+            "top_center": {"allowed_types": ["Parachute"]},
+            "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]}
         },
-        # Keep internal points for drawing or logical centers if needed, but not for general snapping
         "logical_points": {"bottom": pygame.math.Vector2(0, 12.5), "top": pygame.math.Vector2(0, -12.5)}
     },
+    # ... (tank_small - WITH SIDE RULES) ...
     "tank_small": {
         "name": "Small Fuel Tank", "type": "FuelTank", "mass": 20,
-        "fuel_capacity": 100, "width": 20, "height": 40, "color": (255, 255, 255),
+        "fuel_capacity": 100, "width": 19, "height": 40, "color": (255, 255, 255),
         "max_hp": 100,
         "attachment_rules": {
              "top_center": {"allowed_types": ["CommandPod", "FuelTank", "Separator"]},
              "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]},
-             # Example side attachment possibility (if needed later)
-             # "left_center": {"allowed_types": ["Separator", "Winglet"]},
-             # "right_center": {"allowed_types": ["Separator", "Winglet"]},
+             # *** ADDED/UNCOMMENTED SIDE RULES ***
+             # Allow tanks or separators to attach to the sides
+             "left_center": {"allowed_types": ["FuelTank", "Separator", "Engine"]}, # Added Engine example
+             "right_center": {"allowed_types": ["FuelTank", "Separator", "Engine"]}, # Added Engine example
         },
-        "logical_points": {"top": pygame.math.Vector2(0, -20), "bottom": pygame.math.Vector2(0, 20)}
+        # Logical points remain the same, including left/right
+        "logical_points": {
+            "top": pygame.math.Vector2(0, -20), "bottom": pygame.math.Vector2(0, 20),
+            "left": pygame.math.Vector2(-10, 0), "right": pygame.math.Vector2(10, 0)
+        }
     },
+    # ... (engine_basic - maybe add side rules if engines can be side-mounted?) ...
     "engine_basic": {
         "name": "Basic Liquid Engine", "type": "Engine", "mass": 30,
         "thrust": 9.81 * 8 * 150, "fuel_consumption": 0.5,
@@ -37,52 +43,49 @@ PARTS_CATALOG = {
         "max_hp": 80,
         "attachment_rules": {
              "top_center": {"allowed_types": ["CommandPod", "FuelTank", "Separator"]},
+             # Example: Add rules if engine can BE side-attached TO something
+             # "left_center": {"allowed_types": ["FuelTank", "Separator"]}, # Requires matching right point on tank
         },
-         "logical_points": {"top": pygame.math.Vector2(0, -10)}
+         "logical_points": {
+             "top": pygame.math.Vector2(0, -10),
+             # Example: Add point if engine can HAVE things attached to its side
+             # "right": pygame.math.Vector2(9, 0), # Requires matching right_center rule
+         }
     },
-    # --- NEW PARTS ---
+    # ... (parachute_mk1) ...
     "parachute_mk1": {
         "name": "Parachute Mk1", "type": "Parachute", "mass": 10,
         "width": 15, "height": 10, "color": (200, 100, 0), # Orange when packed
         "max_hp": 50,
-        "deploy_drag": 8.0, # Drag coefficient increase when deployed (adjust value)
-        "deploy_area_factor": 10, # Factor to increase effective area when deployed
-        "activatable": True, # Can be clicked in flight
+        "deploy_drag": 8.0,
+        "deploy_area_factor": 10,
+        "activatable": True,
         "attachment_rules": {
-             # Only has a bottom connection point logically
-             "bottom_center": {"allowed_types": ["CommandPod"]}, # Can ONLY attach below to a pod
+             "bottom_center": {"allowed_types": ["CommandPod"]},
         },
         "logical_points": {"bottom": pygame.math.Vector2(0, 5)}
     },
+    # ... (separator_tr_s1 - Add side rules if needed) ...
     "separator_tr_s1": {
         "name": "Transverse Separator S1", "type": "Separator", "mass": 15,
         "width": 20, "height": 8, "color": (200, 200, 0), # Yellow band
         "max_hp": 60,
-        "separation_force": 8000, # Force applied on separation
-        "separation_axis": "transverse", # Separates top from bottom
+        "separation_force": 8000,
+        "separation_axis": "transverse",
         "activatable": True,
         "attachment_rules": {
              "top_center": {"allowed_types": ["CommandPod", "FuelTank", "Separator"]},
              "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]},
+             # Add rules if separators can attach side-to-side or things can attach to their sides
+             # "left_center": {"allowed_types": [...]},
+             # "right_center": {"allowed_types": [...]},
         },
-         "logical_points": {"top": pygame.math.Vector2(0, -4), "bottom": pygame.math.Vector2(0, 4)}
+         "logical_points": {
+             "top": pygame.math.Vector2(0, -4), "bottom": pygame.math.Vector2(0, 4),
+             # Add points if needed
+             # "left": pygame.math.Vector2(-10, 0), "right": pygame.math.Vector2(10, 0),
+         }
     },
-    # Example: Longitudinal Separator (more complex logic needed)
-    # "separator_ln_s1": {
-    #     "name": "Longitudinal Separator S1", "type": "Separator", "mass": 12,
-    #     "width": 8, "height": 40, "color": (0, 100, 200), # Blue band
-    #     "max_hp": 50,
-    #     "separation_force": 6000,
-    #     "separation_axis": "longitudinal", # Separates side-attached items
-    #     "activatable": True,
-    #     "attachment_rules": {
-    #         # Needs logic for how it attaches TO a main stack part
-    #         "attach_to_side": {"allowed_types": ["FuelTank"]}, # e.g., can attach TO the side of a tank
-    #         # Needs logic for what can attach TO IT (boosters?)
-    #         "side_mount": {"allowed_types": ["FuelTank", "Engine"]}
-    #     },
-    #     "logical_points": { ... }
-    # }
 }
 
 def get_part_data(part_id): return PARTS_CATALOG.get(part_id)

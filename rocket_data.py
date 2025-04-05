@@ -2,7 +2,8 @@
 import json
 import pygame
 import os
-from parts import get_part_data, PARTS_CATALOG # Ensure PARTS_CATALOG is imported if needed elsewhere
+from parts import get_part_data, PARTS_CATALOG
+from collections import deque
 
 class PlacedPart:
     def __init__(self, part_id, relative_center_pos, angle=0, connections=None):
@@ -45,6 +46,17 @@ class PlacedPart:
         # Pass the loaded position as the relative_center_pos
         return cls(data["part_id"], pos, data.get("angle", 0))
 
+    def __hash__(self):
+        # Hash based on something unique within the blueprint instance,
+        # like its position or a unique ID if we assigned one.
+        # Using position tuple is simple for grid/unique positions.
+        return hash((self.part_id, self.relative_pos.x, self.relative_pos.y))
+
+    def __eq__(self, other):
+        if not isinstance(other, PlacedPart):
+            return NotImplemented
+        return (self.part_id == other.part_id and
+                self.relative_pos == other.relative_pos)
 
 class RocketBlueprint:
     def __init__(self, name="My Rocket"):
@@ -123,6 +135,83 @@ class RocketBlueprint:
                 part_bottom_y = part_center_y + part_half_height # Assumes angle 0
                 max_y_offset = max(max_y_offset, part_bottom_y)
             return max_y_offset if max_y_offset > -float('inf') else 0.0
+
+    def get_part_bounding_box(self, part: PlacedPart) -> pygame.Rect:
+        """ Helper to get the Rect for a part based on its center and size. """
+        part_data = part.part_data
+        w = part_data.get('width', 1)
+        h = part_data.get('height', 1)
+        rect = pygame.Rect(0, 0, w, h)
+        rect.center = part.relative_pos  # relative_pos is world center
+        return rect
+
+    def find_connected_subassemblies(self) -> list[list[PlacedPart]]:
+        """
+        Finds distinct groups of connected parts within the blueprint.
+        Uses a simple proximity check based on bounding boxes touching.
+        Returns a list of lists, where each inner list is a connected group.
+        """
+        if not self.parts:
+            return []
+
+        all_parts_set = set(self.parts)
+        visited = set()
+        subassemblies = []
+
+        while len(visited) < len(self.parts):
+            # Find the next unvisited part to start a new search from
+            start_node = None
+            for part in self.parts:  # Iterate in order to potentially find root first
+                if part not in visited:
+                    start_node = part
+                    break
+
+            if start_node is None:  # Should not happen if len(visited) < len(self.parts)
+                break
+
+            current_assembly = []
+            queue = deque([start_node])
+            visited.add(start_node)
+
+            while queue:
+                current_part = queue.popleft()
+                current_assembly.append(current_part)
+                current_rect = self.get_part_bounding_box(current_part)
+
+                # Find neighbors (parts touching the current part)
+                for other_part in all_parts_set:
+                    if other_part not in visited:
+                        other_rect = self.get_part_bounding_box(other_part)
+                        # Check if bounding boxes overlap/touch (inflate slightly)
+                        if current_rect.inflate(2, 2).colliderect(other_rect):
+                            visited.add(other_part)
+                            queue.append(other_part)
+
+            if current_assembly:
+                subassemblies.append(current_assembly)
+
+        # Optional: Sort subassemblies (e.g., put the one with the root command pod first)
+        def sort_key(assembly):
+            for part in assembly:
+                if part.part_data.get("type") == "CommandPod":
+                    # Check if it's the *original* root (parts[0] in initial list)
+                    # This assumes the original root remains parts[0] after loading/saving
+                    try:
+                        if self.parts and part == self.parts[0]:
+                            return 0  # Prioritize original root
+                        else:
+                            return 1  # Other command pods next
+                    except IndexError:
+                        return 1  # Should not happen if self.parts exists
+            return 2  # Assemblies without command pods last
+
+        subassemblies.sort(key=sort_key)
+
+        print(f"Connectivity check found {len(subassemblies)} subassemblies.")
+        # for i, asm in enumerate(subassemblies):
+        #     print(f"  Assembly {i}: {[p.part_id for p in asm]}")
+
+        return subassemblies
 
     def save_to_json(self, filename):
         # Ensure the assets directory exists
