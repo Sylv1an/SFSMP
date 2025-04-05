@@ -155,6 +155,54 @@ class FlyingRocket:
         self.throttle_level = 0.0
         self.master_thrust_enabled = False
 
+    def calculate_subassembly_world_com(self, subassembly_parts: list[PlacedPart]) -> pygame.math.Vector2:
+        """ Calculates the world CoM of a given list of parts belonging to this rocket instance. """
+        if not subassembly_parts:
+            # Return current CoM as fallback, though this shouldn't be called with empty list
+            return self.get_world_com()
+
+        sub_mass = 0.0
+        sub_com_numerator = pygame.math.Vector2(0, 0)
+        # Note: Fuel calculation here is tricky. For simplicity, assume fuel is distributed
+        # proportionally based on the tanks *remaining* in the subassembly.
+        # A more accurate model would track fuel per tank.
+
+        # Quick fuel estimate for CoM calc (can be refined)
+        sub_fuel_cap = sum(
+            p.part_data.get("fuel_capacity", 0) for p in subassembly_parts if p.part_data.get("type") == "FuelTank")
+        total_original_fuel_cap = sum(
+            p.part_data.get("fuel_capacity", 0) for p in self.fuel_tanks)  # Use original tank list capacity
+        total_original_fuel_cap = max(1.0, total_original_fuel_cap)
+        # Estimate fuel in this subassembly based on proportion of capacity
+        estimated_sub_fuel = self.current_fuel * (sub_fuel_cap / total_original_fuel_cap)
+        sub_fuel_mass = estimated_sub_fuel * self.fuel_mass_per_unit
+        sub_fuel_cap = max(1.0, sub_fuel_cap)  # Avoid div by zero
+
+        for part in subassembly_parts:
+            part_mass = part.part_data.get("mass", 0)
+            if part.part_data.get("type") == "FuelTank":
+                # Distribute estimated subassembly fuel mass among its tanks
+                part_fuel_mass = sub_fuel_mass * (part.part_data.get("fuel_capacity", 0) / sub_fuel_cap)
+                part_mass += part_fuel_mass
+
+            sub_mass += part_mass
+            # Use the part's relative_pos (relative to blueprint 0,0)
+            sub_com_numerator += part.relative_pos * part_mass
+
+        if sub_mass > 0.01:
+            sub_com_offset_relative = sub_com_numerator / sub_mass
+        else:
+            # Fallback: geometric center relative to 0,0
+            if subassembly_parts:
+                sub_com_offset_relative = sum((p.relative_pos for p in subassembly_parts), pygame.math.Vector2()) / len(
+                    subassembly_parts)
+            else:
+                sub_com_offset_relative = pygame.math.Vector2(0, 0)
+
+        # Convert relative CoM offset to world position
+        sub_com_offset_rotated = sub_com_offset_relative.rotate(-self.angle)
+        sub_world_com = self.pos + sub_com_offset_rotated
+        return sub_world_com
 
     def calculate_physics_properties(self):
         """ Recalculates mass, CoM, and MoI based on current parts and fuel. """
@@ -237,6 +285,7 @@ class FlyingRocket:
 
     def get_world_part_center(self, part: PlacedPart):
         """ Calculates the absolute world position of a specific part's center. """
+        # Assumes part.relative_angle is 0 for AABB calculation simplicity
         part_offset_rotated = part.relative_pos.rotate(-self.angle)
         return self.pos + part_offset_rotated
 
@@ -356,36 +405,74 @@ class FlyingRocket:
         # Return total force vector, world application point, and consumption rate (at 100% throttle)
         return total_thrust_force, world_thrust_application_point, total_consumption_rate_100
 
+    # *** NEW METHOD ***
+    def get_world_part_aabb(self, part: PlacedPart) -> pygame.Rect:
+            """
+            Calculates an approximate world Axis-Aligned Bounding Box for a part.
+            NOTE: Ignores part rotation relative to the rocket body for simplicity.
+                  Uses the rocket's overall angle for placement but not for box orientation.
+            """
+            part_data = part.part_data
+            w = part_data.get('width', 1)
+            h = part_data.get('height', 1)
+            # Get the part's center in world coordinates
+            world_center = self.get_world_part_center(part)
+            # Create the AABB centered on the world position
+            aabb = pygame.Rect(0, 0, w, h)
+            aabb.center = world_center
+            return aabb
 
-    def apply_collision_damage(self, impact_velocity_magnitude):
-        """ Applies damage to parts near the lowest point based on impact velocity. """
-        # This method assumes it's called only when damage conditions are met (checked in update)
-        if impact_velocity_magnitude < MIN_IMPACT_VEL_DAMAGE: # Redundant check, but safe
-            return
+    # *** MODIFIED METHOD SIGNATURE ***
+    def apply_collision_damage(self, impact_velocity_magnitude, specific_part_to_damage: PlacedPart | None = None):
+        """
+        Applies damage based on impact velocity.
+        If specific_part_to_damage is provided (inter-rocket collision), applies damage there primarily.
+        Otherwise (ground collision), applies to lowest part(s).
+        """
+        # Check minimum impact threshold
+        if impact_velocity_magnitude < MIN_IMPACT_VEL_DAMAGE:
+            return # No damage below threshold
 
+        # Calculate damage amount
         damage = (impact_velocity_magnitude ** 1.8) * COLLISION_DAMAGE_FACTOR
-        print(f"Impact Vel: {impact_velocity_magnitude:.1f} -> Damage: {damage:.1f}")
+        print(f"[{self.sim_instance_id}] Impact Vel: {impact_velocity_magnitude:.1f} -> Damage: {damage:.1f}")
 
-        lowest_point_world = self.get_lowest_point_world()
-        impacted_parts = self.get_parts_near_world_pos(lowest_point_world, radius=15.0)
+        # Determine which parts to apply damage to
+        impacted_parts = []
+        if specific_part_to_damage and specific_part_to_damage in self.parts:
+             # Target the specific part from inter-rocket collision
+             impacted_parts = [specific_part_to_damage]
+             print(f"  Targeting specific part: {specific_part_to_damage.part_id}")
+        elif not specific_part_to_damage: # Ground collision (specific_part is None)
+            lowest_point_world = self.get_lowest_point_world()
+            impacted_parts = self.get_parts_near_world_pos(lowest_point_world, radius=15.0)
+            if not impacted_parts and self.parts: # Fallback if radius check fails
+                 lowest_part = min(self.parts, key=lambda p: self.get_world_part_center(p).y)
+                 if lowest_part: impacted_parts = [lowest_part]
+        # Else: specific_part was provided but not found in self.parts - do nothing? Or log error?
 
-        if not impacted_parts and self.parts:
-             lowest_part = min(self.parts, key=lambda p: self.get_world_part_center(p).y)
-             if lowest_part: impacted_parts = [lowest_part]
-
+        # Apply damage to the determined parts
         parts_destroyed_this_impact = []
         for part in impacted_parts:
-            if part.is_broken: continue
+            if part.is_broken: continue # Skip already broken parts
+
             part.current_hp -= damage
             print(f"  Part '{part.part_id}' HP: {part.current_hp:.0f} / {part.part_data.get('max_hp', 1)}")
+
             if part.current_hp <= 0:
                 print(f"  >> Part '{part.part_id}' BROKEN! <<")
                 part.is_broken = True
                 part.current_hp = 0
                 parts_destroyed_this_impact.append(part)
                 part_center_world = self.get_world_part_center(part)
-                self.effects.append(ExplosionEffect(part_center_world)) # Ensure ExplosionEffect class exists
+                # Create explosion effect
+                try:
+                    # Make sure ExplosionEffect class is defined globally or imported
+                    self.effects.append(ExplosionEffect(part_center_world))
+                except NameError:
+                    print("Error: ExplosionEffect class not defined or imported.")
 
+        # If parts were destroyed, trigger the handling logic
         if parts_destroyed_this_impact:
             self.handle_destroyed_parts(parts_destroyed_this_impact)
 
@@ -548,8 +635,10 @@ class FlyingRocket:
         control_torque_input = 0
         if self.has_active_control:
             keys = pygame.key.get_pressed()
-            if keys[pygame.K_RIGHT] or keys[pygame.K_d]: control_torque_input += REACTION_WHEEL_TORQUE
-            if keys[pygame.K_LEFT] or keys[pygame.K_a]: control_torque_input -= REACTION_WHEEL_TORQUE
+            if keys[pygame.K_LEFT] or keys[pygame.K_a]:  # A/Left rotates Counter-Clockwise (+)
+                control_torque_input += REACTION_WHEEL_TORQUE
+            if keys[pygame.K_RIGHT] or keys[pygame.K_d]:  # D/Right rotates Clockwise (-)
+                control_torque_input -= REACTION_WHEEL_TORQUE
             net_torque += control_torque_input
 
 
@@ -588,7 +677,7 @@ class FlyingRocket:
                  should_apply_damage = True
 
             if should_apply_damage:
-                self.apply_collision_damage(impact_vel_mag)
+                self.apply_collision_damage(impact_vel_mag, specific_part_to_damage=None)
 
             self.landed = True # Set landed flag *after* damage check
 
@@ -766,7 +855,7 @@ def draw_terrain(surface, camera):
     ground_rect_screen = camera.apply_rect(ground_view_rect)
     pygame.draw.rect(surface, COLOR_GROUND, ground_rect_screen)
 
-# --- Simulation Runner Function (MAJOR REWORK) ---
+# --- Simulation Runner Function (REVISED STRUCTURE) ---
 def run_simulation(screen, clock, blueprint_file):
     print(f"--- Starting Simulation ---")
     print(f"Loading blueprint: {blueprint_file}")
@@ -777,79 +866,108 @@ def run_simulation(screen, clock, blueprint_file):
     if not initial_blueprint or not initial_blueprint.parts:
         print("Blueprint load failed or blueprint is empty."); return
 
-    # --- Initial Setup ---
-    all_rockets: list[FlyingRocket] = [] # List to hold all active rocket instances
-    controlled_rocket: FlyingRocket | None = None # The rocket instance the player controls
+    # --- Initial Simulation State Setup ---
+    all_rockets: list[FlyingRocket] = []
+    controlled_rocket: FlyingRocket | None = None
     next_sim_id = 0
-    newly_created_rockets = [] # Temp list for rockets created mid-frame
 
-    # Get the reference to the original root part (usually the first command pod)
-    original_root_part_instance = initial_blueprint.parts[0] if initial_blueprint.parts and initial_blueprint.parts[0].part_data.get("type") == "CommandPod" else None
+    # --- *** REVISED ROOT PART IDENTIFICATION *** ---
+    original_root_part_instance = None
+    if initial_blueprint.parts:
+        # Try finding the first CommandPod in the entire list
+        for part in initial_blueprint.parts:
+            # Ensure part_data is accessible; might need get_part_data if not stored directly
+            # Assuming part.part_data exists from PlacedPart init
+            if part.part_data and part.part_data.get("type") == "CommandPod":
+                original_root_part_instance = part
+                print(f"DEBUG: Identified CommandPod '{part.part_id}' as the potential root reference.")
+                break # Found the first one, stop searching
+        if original_root_part_instance is None:
+             print("Warning: No CommandPod found in blueprint. Control will be assigned arbitrarily if possible.")
+             # No specific root reference exists
+    # --- *** END REVISED ROOT IDENTIFICATION *** ---
 
-    # --- Find Connected Subassemblies and Create Initial Rockets ---
+
+    # --- Create Initial Rocket Instances from Blueprint ---
     initial_subassemblies = initial_blueprint.find_connected_subassemblies()
-
     if not initial_subassemblies:
-        print("Error: No parts found after connectivity check (shouldn't happen if load succeeded)."); return
+        print("Error: No parts found after connectivity check."); return
 
     for i, assembly_parts in enumerate(initial_subassemblies):
-        if not assembly_parts: continue # Skip empty assemblies
-
-        # Calculate start position offset for this assembly
-        # Place the first assembly (presumably the main one) on the launchpad
-        # Place other initial assemblies nearby? Or let them fall? Start them on ground too.
-        temp_bp = RocketBlueprint() # Temp blueprint to calculate lowest point
-        temp_bp.parts = assembly_parts
+        if not assembly_parts: continue
+        # Create temporary blueprint to get dimensions for positioning
+        temp_bp = RocketBlueprint(); temp_bp.parts = assembly_parts
         lowest_offset_y = temp_bp.get_lowest_point_offset_y()
-        # Add horizontal offset for subsequent assemblies to avoid immediate overlap
-        start_x = i * 50 # Simple horizontal offset based on assembly index
+        start_x = i * 50 # Simple horizontal offset for multiple initial assemblies
         start_y = GROUND_Y - lowest_offset_y - 0.1 # Start just above ground
+        target_initial_com_pos = pygame.math.Vector2(start_x, start_y) # Target CoM position
 
-        # This is the target world position for the CoM of the assembly
-        target_initial_com_pos = pygame.math.Vector2(start_x, start_y)
+        # Check if this assembly contains the identified root part instance
+        contains_original_root = original_root_part_instance and (original_root_part_instance in assembly_parts)
 
-        # Check if this assembly contains the original root part
-        contains_original_root = original_root_part_instance in assembly_parts
-        is_primary = (controlled_rocket is None and contains_original_root) # First one with root gets control
+        # Assign control if this is the first assembly AND it contains the root
+        # Or fallback to first assembly if no root pod exists at all
+        is_primary = (controlled_rocket is None and contains_original_root) or \
+                     (controlled_rocket is None and original_root_part_instance is None and i == 0)
 
         try:
-            # Create copies of parts for the new rocket instance
-            # Need deep copies here? PlacedPart.from_dict should handle this if used carefully.
-            # Let's assume the list contains unique PlacedPart instances for now.
             rocket_instance = FlyingRocket(
                 parts_list=list(assembly_parts), # Pass a copy of the list
-                initial_pos_offset=target_initial_com_pos,
+                initial_pos_offset=target_initial_com_pos, # Target CoM world pos
                 initial_angle=0,
                 initial_vel=pygame.math.Vector2(0,0),
                 sim_instance_id=next_sim_id,
-                is_primary_control=is_primary,
-                original_root_ref=original_root_part_instance # Pass down the original root ref
+                is_primary_control=is_primary, # Initial hint, might be overridden below
+                # Pass the found root instance (or None)
+                original_root_ref=original_root_part_instance
             )
             all_rockets.append(rocket_instance)
+
             if is_primary:
-                controlled_rocket = rocket_instance
-                print(f"Created initial controlled rocket {next_sim_id} with {len(assembly_parts)} parts.")
+                 controlled_rocket = rocket_instance
+                 # Explicitly set the actual control flag based on whether root exists *in this instance*
+                 # This uses the check logic now inside FlyingRocket.update
+                 root_ref_in_instance = controlled_rocket.original_root_part_ref
+                 controlled_rocket.has_active_control = (root_ref_in_instance is not None) and \
+                                                        (root_ref_in_instance in controlled_rocket.parts) and \
+                                                        (not root_ref_in_instance.is_broken) # Check broken state too
+                 control_status_msg = 'CONTROLLED' if controlled_rocket.has_active_control else 'CONTROLLED (No Pod/Broken)'
+                 print(f"Created initial rocket {next_sim_id} ({control_status_msg}) with {len(assembly_parts)} parts.")
+
             else:
-                print(f"Created initial debris/secondary rocket {next_sim_id} with {len(assembly_parts)} parts.")
+                 # Ensure non-primary rockets start with has_active_control as False
+                 rocket_instance.has_active_control = False
+                 print(f"Created initial rocket {next_sim_id} (DEBRIS) with {len(assembly_parts)} parts.")
             next_sim_id += 1
-
         except Exception as e:
-            print(f"Fatal Error initializing rocket instance {next_sim_id}: {e}")
-            # Continue trying to create others? Or exit? For robustness, maybe continue.
+            print(f"Error initializing rocket instance {next_sim_id}: {e}")
 
+
+    # Safety check if control assignment somehow failed but rockets exist
     if controlled_rocket is None and all_rockets:
-         print("Warning: No initial command pod found, assigning control to first assembly.")
+         print("Warning: Fallback control assignment to first assembly.")
          controlled_rocket = all_rockets[0]
-         controlled_rocket.has_active_control = True # Grant control manually
+         # Grant active control only if it actually has the valid root pod ref
+         root_ref_in_fallback = controlled_rocket.original_root_part_ref
+         controlled_rocket.has_active_control = (root_ref_in_fallback is not None) and \
+                                                (root_ref_in_fallback in controlled_rocket.parts) and \
+                                                (not root_ref_in_fallback.is_broken)
+
 
     # --- Setup Camera, Stars, UI ---
     camera = Camera(SCREEN_WIDTH, SCREEN_HEIGHT)
     if controlled_rocket: camera.update(controlled_rocket.get_world_com())
     elif all_rockets: camera.update(all_rockets[0].get_world_com())
-    else: camera.update(pygame.math.Vector2(0, GROUND_Y)) # Fallback
+    else: camera.update(pygame.math.Vector2(0, GROUND_Y))
 
-    star_area_bounds = pygame.Rect(-WORLD_WIDTH * 2, SPACE_Y_LIMIT - STAR_FIELD_DEPTH, WORLD_WIDTH * 4, abs(SPACE_Y_LIMIT) + GROUND_Y + STAR_FIELD_DEPTH*1.5)
-    stars = create_stars(STAR_COUNT * 2, star_area_bounds) # Ensure create_stars is defined
+    # Ensure these helper functions exist or are defined above
+    try:
+        star_area_bounds = pygame.Rect(-WORLD_WIDTH * 2, SPACE_Y_LIMIT - STAR_FIELD_DEPTH, WORLD_WIDTH * 4, abs(SPACE_Y_LIMIT) + GROUND_Y + STAR_FIELD_DEPTH*1.5)
+        stars = create_stars(STAR_COUNT * 2, star_area_bounds)
+    except NameError:
+        print("Warning: create_stars or related constants not found, skipping star creation.")
+        stars = []
+
     ui_font = pygame.font.SysFont(None, 20)
     ui_font_large = pygame.font.SysFont(None, 36)
 
@@ -861,242 +979,264 @@ def run_simulation(screen, clock, blueprint_file):
         dt = clock.tick(60) / 1000.0
         dt = min(dt, 0.05) # Clamp max dt
 
-        newly_created_rockets.clear() # Clear temp list for this frame
-        rockets_to_remove = []
+        # --- Frame State Initialization ---
+        newly_created_rockets_this_frame: list[FlyingRocket] = []
+        rockets_to_remove_this_frame: list[FlyingRocket] = []
 
         # --- Event Handling ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT: pygame.quit(); sys.exit()
             if event.type == pygame.KEYDOWN:
+                # DEBUG PRINT BEFORE INPUT
+                # if controlled_rocket: print(f"DEBUG: KeyDown Check - Controlled: {controlled_rocket.sim_instance_id}, ActiveCtrl: {controlled_rocket.has_active_control}")
+                # else: print("DEBUG: KeyDown Check - No Controlled Rocket!")
+
                 if event.key == pygame.K_ESCAPE: sim_running = False
                 # Apply inputs ONLY to the controlled rocket
-                if controlled_rocket:
-                    if event.key == pygame.K_SPACE: controlled_rocket.master_thrust_enabled = not controlled_rocket.master_thrust_enabled
-                    if event.key == pygame.K_p: # Example parachute key
+                if controlled_rocket and controlled_rocket.has_active_control: # Also check has_active_control here
+                    if event.key == pygame.K_SPACE:
+                        controlled_rocket.master_thrust_enabled = not controlled_rocket.master_thrust_enabled
+                        print(f"[{controlled_rocket.sim_instance_id}] Master Thrust set to: {controlled_rocket.master_thrust_enabled}")
+                    if event.key == pygame.K_p:
                          for chute in controlled_rocket.parachutes:
-                             if not chute.deployed and not chute.is_broken: chute.deployed = True
+                             if not chute.deployed and not chute.is_broken:
+                                 chute.deployed = True; print(f"Deployed {chute.part_id} via key.")
 
-                # Respawn Logic (Clears ALL rockets and reloads from blueprint file)
+                # --- Respawn Logic ---
                 current_time = time.time()
-                if event.key == pygame.K_r and (current_time - last_respawn_time > 2.0):
+                if event.key == pygame.K_r and (current_time - last_respawn_time > 1.0):
                     print("--- RESPAWNING ROCKET ---"); last_respawn_time = current_time
-                    # Reload blueprint, find assemblies, create new set of rockets
-                    # (This logic needs to be wrapped in a function or repeated here)
-                    # --- Respawn Start ---
-                    all_rockets.clear(); controlled_rocket = None; newly_created_rockets.clear() # Reset state
+                    all_rockets.clear(); controlled_rocket = None; newly_created_rockets_this_frame.clear(); rockets_to_remove_this_frame.clear()
                     reloaded_blueprint = RocketBlueprint.load_from_json(blueprint_file)
                     if reloaded_blueprint and reloaded_blueprint.parts:
-                        original_root_part_instance = reloaded_blueprint.parts[0] if reloaded_blueprint.parts[0].part_data.get("type") == "CommandPod" else None
+                        # --- Repeat root finding on reload ---
+                        original_root_part_instance = None
+                        for part in reloaded_blueprint.parts:
+                            if part.part_data and part.part_data.get("type") == "CommandPod":
+                                original_root_part_instance = part; break
+                        # --- Repeat initial rocket creation loop ---
                         initial_subassemblies = reloaded_blueprint.find_connected_subassemblies()
                         for i, assembly_parts in enumerate(initial_subassemblies):
                             if not assembly_parts: continue
                             temp_bp = RocketBlueprint(); temp_bp.parts = assembly_parts
-                            lowest_offset_y = temp_bp.get_lowest_point_offset_y()
-                            start_x = i * 50; start_y = GROUND_Y - lowest_offset_y - 0.1
+                            lowest_offset_y = temp_bp.get_lowest_point_offset_y(); start_x = i * 50; start_y = GROUND_Y - lowest_offset_y - 0.1
                             target_initial_com_pos = pygame.math.Vector2(start_x, start_y)
-                            contains_original_root = original_root_part_instance in assembly_parts
-                            is_primary = (controlled_rocket is None and contains_original_root)
+                            contains_original_root = original_root_part_instance and (original_root_part_instance in assembly_parts)
+                            is_primary = (controlled_rocket is None and contains_original_root) or \
+                                         (controlled_rocket is None and original_root_part_instance is None and i == 0)
                             try:
                                 rocket_instance = FlyingRocket(list(assembly_parts), target_initial_com_pos, 0, pygame.math.Vector2(0,0), next_sim_id, is_primary, original_root_part_instance)
-                                newly_created_rockets.append(rocket_instance) # Add to temp list first
-                                if is_primary: controlled_rocket = rocket_instance
+                                newly_created_rockets_this_frame.append(rocket_instance)
+                                if is_primary:
+                                     controlled_rocket = rocket_instance
+                                     root_ref_in_instance = controlled_rocket.original_root_part_ref
+                                     controlled_rocket.has_active_control = (root_ref_in_instance is not None) and (root_ref_in_instance in controlled_rocket.parts) and (not root_ref_in_instance.is_broken)
+                                else:
+                                     rocket_instance.has_active_control = False
                                 next_sim_id += 1
                             except Exception as e: print(f"Respawn Error creating instance: {e}")
-                        if controlled_rocket is None and newly_created_rockets: controlled_rocket = newly_created_rockets[0]; controlled_rocket.has_active_control = True
+                        if controlled_rocket is None and newly_created_rockets_this_frame:
+                             controlled_rocket = newly_created_rockets_this_frame[0]
+                             root_ref_in_fallback = controlled_rocket.original_root_part_ref
+                             controlled_rocket.has_active_control = (root_ref_in_fallback is not None) and (root_ref_in_fallback in controlled_rocket.parts) and (not root_ref_in_fallback.is_broken)
                         print("Respawn Complete.")
                     else: print("Respawn Failed: Cannot reload blueprint.")
-                    # --- Respawn End ---
+                    # Immediately process adds/removes after respawn
+                    all_rockets.extend(newly_created_rockets_this_frame); newly_created_rockets_this_frame.clear()
 
 
             # Mouse Click Activation (only on controlled rocket)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                 if controlled_rocket:
-                     click_screen_pos = pygame.math.Vector2(event.pos)
-                     click_world_pos = click_screen_pos + camera.offset
+                 if controlled_rocket: # Check if controlled_rocket exists
+                     click_screen_pos = pygame.math.Vector2(event.pos); click_world_pos = click_screen_pos + camera.offset
                      controlled_rocket.activate_part_at_pos(click_world_pos)
 
         # --- Continuous Input (Throttle for controlled rocket) ---
-        if controlled_rocket:
+        # Check if controlled and if it actually has control ability
+        if controlled_rocket and controlled_rocket.has_active_control:
             keys = pygame.key.get_pressed()
             throttle_change = 0
             if keys[pygame.K_w] or keys[pygame.K_UP]: throttle_change += THROTTLE_CHANGE_RATE * dt
             if keys[pygame.K_s] or keys[pygame.K_DOWN]: throttle_change -= THROTTLE_CHANGE_RATE * dt
-            if throttle_change != 0: controlled_rocket.throttle_level = max(0.0, min(1.0, controlled_rocket.throttle_level + throttle_change))
-            # Rotation controls are handled inside rocket.update based on key state
+            if throttle_change != 0:
+                controlled_rocket.throttle_level = max(0.0, min(1.0, controlled_rocket.throttle_level + throttle_change))
 
-        # --- Updates ---
+        # --- Stage 1: Update Physics for all active rockets ---
         for rocket in all_rockets:
-            if not rocket.is_active:
-                if rocket not in rockets_to_remove: rockets_to_remove.append(rocket)
-                continue
-
-            # Update physics
+            if not rocket.is_active: continue
             rocket_com_alt = GROUND_Y - rocket.get_world_com().y
-            current_air_density = get_air_density(rocket_com_alt) # Ensure get_air_density exists
+            # Ensure get_air_density exists or provide default
+            try: current_air_density = get_air_density(rocket_com_alt)
+            except NameError: current_air_density = 0.0
             rocket.update(dt, current_air_density)
+            # Check if rocket became inactive AFTER update
+            if not rocket.is_active and rocket not in rockets_to_remove_this_frame:
+                 rockets_to_remove_this_frame.append(rocket)
 
-            # --- Check for splits caused by destruction ---
+
+        # --- Stage 1.5: Inter-Rocket Collision Detection & Response ---
+        collision_pairs_processed = set()
+        for i, r1 in enumerate(all_rockets):
+            if r1 in rockets_to_remove_this_frame or not r1.is_active: continue
+            for j in range(i + 1, len(all_rockets)):
+                r2 = all_rockets[j]
+                if r2 in rockets_to_remove_this_frame or not r2.is_active: continue
+                # Optional Broad Phase Check (keep if implemented)
+                # ...
+                # Narrow Phase
+                collision_found_between_r1_r2 = False
+                for p1 in r1.parts:
+                    if p1.is_broken: continue
+                    rect1 = r1.get_world_part_aabb(p1)
+                    for p2 in r2.parts:
+                        if p2.is_broken: continue
+                        rect2 = r2.get_world_part_aabb(p2)
+                        if rect1.colliderect(rect2):
+                            pair_key = tuple(sorted((r1.sim_instance_id, r2.sim_instance_id)))
+                            if pair_key in collision_pairs_processed: continue
+                            print(f"COLLISION: R{r1.sim_instance_id}({p1.part_id}) & R{r2.sim_instance_id}({p2.part_id})")
+                            collision_found_between_r1_r2 = True
+                            collision_pairs_processed.add(pair_key)
+                            # Collision Response (Damage + Push)
+                            relative_velocity = r1.vel - r2.vel; impact_speed = relative_velocity.length()
+                            r1.apply_collision_damage(impact_speed, specific_part_to_damage=p1)
+                            r2.apply_collision_damage(impact_speed, specific_part_to_damage=p2)
+                            # Basic Push Apart (keep if implemented)
+                            # ... (push logic) ...
+                            break # Stop checking r2 parts against p1
+                    if collision_found_between_r1_r2: break # Stop checking r1 parts
+
+
+        # --- Stage 2: Process State Changes (Destruction Splits, Separations) ---
+        rockets_to_process = list(all_rockets) # Iterate over copy
+        for rocket in rockets_to_process:
+            if rocket in rockets_to_remove_this_frame or not rocket.is_active: continue
+            processed_split_this_frame = False
+            # --- Check for destruction splits ---
             if rocket.needs_connectivity_check:
-                rocket.needs_connectivity_check = False # Reset flag
-                print(f"[{rocket.sim_instance_id}] Re-checking connectivity...")
-                # Create a temporary blueprint to run the check
-                temp_bp = RocketBlueprint()
-                temp_bp.parts = rocket.parts # Use current parts list
+                rocket.needs_connectivity_check = False; print(f"[{rocket.sim_instance_id}] Re-checking connectivity (Destruction)...")
+                temp_bp = RocketBlueprint(); temp_bp.parts = rocket.parts
                 subassemblies = temp_bp.find_connected_subassemblies()
-
                 if len(subassemblies) > 1:
-                    print(f"[{rocket.sim_instance_id}] SPLIT DETECTED into {len(subassemblies)} pieces!")
-                    # Mark the original rocket for removal
-                    if rocket not in rockets_to_remove: rockets_to_remove.append(rocket)
-                    # Create new rockets for the separated pieces
+                    processed_split_this_frame = True; print(f"[{rocket.sim_instance_id}] SPLIT DETECTED (Destruction) into {len(subassemblies)} pieces!")
+                    if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
                     for assembly_parts in subassemblies:
                          if not assembly_parts: continue
                          try:
-                             # New pieces inherit velocity/angle/angular_vel from the original
-                             # Position needs careful handling - start CoM where it was
-                             new_com_target = rocket.get_world_com() # Approximate starting point
-                             # Check if this new assembly contains the original root
-                             contains_original_root = rocket.original_root_part_ref in assembly_parts
-                             # Grant control ONLY if the original rocket had it AND this piece has the root
-                             is_primary = rocket.has_active_control and contains_original_root
-
-                             new_rocket = FlyingRocket(
-                                 parts_list=list(assembly_parts),
-                                 initial_pos_offset=new_com_target, # Target CoM position
-                                 initial_angle=rocket.angle,
-                                 initial_vel=rocket.vel, # Inherit velocity
-                                 # TODO: Inherit angular velocity too?
-                                 sim_instance_id=next_sim_id,
-                                 is_primary_control=is_primary,
-                                 original_root_ref=rocket.original_root_part_ref
-                             )
-                             new_rocket.angular_velocity = rocket.angular_velocity # Inherit spin
-
-                             newly_created_rockets.append(new_rocket)
-                             if is_primary:
-                                 print(f"  > New controlled rocket {next_sim_id} created from split.")
-                                 # controlled_rocket = new_rocket # Assign control later after main loop iteration
-                             else:
-                                  print(f"  > New debris rocket {next_sim_id} created from split.")
+                             sub_world_com = rocket.calculate_subassembly_world_com(assembly_parts)
+                             contains_root = rocket.original_root_part_ref in assembly_parts
+                             is_primary = rocket.has_active_control and contains_root
+                             new_rocket = FlyingRocket(list(assembly_parts), sub_world_com, rocket.angle, rocket.vel, next_sim_id, is_primary, rocket.original_root_part_ref)
+                             new_rocket.angular_velocity = rocket.angular_velocity
+                             newly_created_rockets_this_frame.append(new_rocket)
+                             print(f"  > New {'controlled' if is_primary else 'debris'} rocket {next_sim_id} (destruction split).")
                              next_sim_id += 1
-                         except Exception as e:
-                             print(f"Error creating rocket instance from split: {e}")
+                         except Exception as e: print(f"Error creating rocket from destruction split: {e}")
 
-                # else: No split occurred after destruction check
-
-
-            # --- Check for splits caused by separators ---
-            if rocket.pending_separation:
+            # --- Check for separator splits ---
+            if rocket.pending_separation and not processed_split_this_frame:
                  print(f"[{rocket.sim_instance_id}] Processing {len(rocket.pending_separation)} separations...")
-                 separators_processed_this_frame = list(rocket.pending_separation) # Copy list
-                 rocket.pending_separation.clear() # Clear original pending list
+                 separators_activated = list(rocket.pending_separation); rocket.pending_separation.clear()
+                 parts_at_start = list(rocket.parts); parts_remaining = list(rocket.parts)
+                 split_occurred_by_sep = False
+                 for sep_part in separators_activated:
+                     if sep_part not in parts_remaining: continue
+                     print(f"  Processing separator: {sep_part.part_id}")
+                     sep_world_pos = rocket.get_world_part_center(sep_part); sep_force = sep_part.part_data.get("separation_force", 1000)
+                     current_check_list = [p for p in parts_remaining if p != sep_part]
+                     temp_bp = RocketBlueprint(); temp_bp.parts = current_check_list
+                     subassemblies = temp_bp.find_connected_subassemblies()
+                     if len(subassemblies) > 1:
+                         split_occurred_by_sep = True; print(f"  > SPLIT CONFIRMED by {sep_part.part_id} into {len(subassemblies)} pieces!")
+                         if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
+                         for assembly_parts in subassemblies:
+                              if not assembly_parts: continue
+                              try:
+                                  sub_world_com = rocket.calculate_subassembly_world_com(assembly_parts)
+                                  contains_root = rocket.original_root_part_ref in assembly_parts
+                                  is_primary = rocket.has_active_control and contains_root
+                                  new_rocket = FlyingRocket(list(assembly_parts), sub_world_com, rocket.angle, rocket.vel, next_sim_id, is_primary, rocket.original_root_part_ref)
+                                  new_rocket.angular_velocity = rocket.angular_velocity
+                                  # Apply Impulse
+                                  sep_vec = new_rocket.get_world_com() - sep_world_pos
+                                  sep_dir = sep_vec.normalize() if sep_vec.length() > 0 else pygame.math.Vector2(0,-1).rotate(-rocket.angle)
+                                  impulse_mag = (sep_force / max(0.1, new_rocket.total_mass)) * 0.05 # Tune multiplier
+                                  delta_v = sep_dir * impulse_mag; new_rocket.vel += delta_v
+                                  print(f"    Applying impulse {delta_v.length():.1f} to new rocket {next_sim_id}")
+                                  newly_created_rockets_this_frame.append(new_rocket)
+                                  print(f"    > New {'controlled' if is_primary else 'debris'} rocket {next_sim_id} (separation).")
+                                  next_sim_id += 1
+                              except Exception as e: print(f"Error creating rocket from separation split: {e}")
+                         break # Stop processing separators for this original rocket as it's being replaced
+                     else:
+                         print(f"  > Separator {sep_part.part_id} did not cause a split.")
+                         parts_remaining = current_check_list # Update remaining list for next sep check
+                 if not split_occurred_by_sep and len(parts_remaining) < len(parts_at_start):
+                      print(f"[{rocket.sim_instance_id}] Updating parts after non-splitting separation(s).")
+                      rocket.parts = parts_remaining
+                      # Update component lists & physics
+                      rocket.engines = [e for e in rocket.engines if e in rocket.parts]; rocket.fuel_tanks = [t for t in rocket.fuel_tanks if t in rocket.parts]; rocket.parachutes = [pc for pc in rocket.parachutes if pc in rocket.parts]; rocket.separators = [s for s in rocket.separators if s in rocket.parts]
+                      if not rocket.parts: rocket.is_active = False; rockets_to_remove_this_frame.append(rocket)
+                      else: rocket.calculate_physics_properties(); rocket.calculate_bounds()
 
-                 # *** SEPARATOR LOGIC (Placeholder - Complex) ***
-                 # This needs implementation based on Phase 2 plan:
-                 # 1. For each separator in separators_processed_this_frame:
-                 # 2. Identify parts "above" and "below" (or radial).
-                 # 3. Create new part lists for each section.
-                 # 4. Create new FlyingRocket instances (add to newly_created_rockets).
-                 # 5. Apply separation impulse (modify velocity of new rockets).
-                 # 6. Remove separated parts AND the separator itself from THIS rocket instance.
-                 # 7. Recalculate physics for THIS instance.
-                 # 8. If THIS instance becomes empty, mark it for removal.
-                 print(f"[{rocket.sim_instance_id}] Separator logic not fully implemented yet.")
-                 # Basic: Remove the separator part itself for now
-                 parts_to_remove_from_sep = []
-                 for sep_part in separators_processed_this_frame:
-                      if sep_part in rocket.parts:
-                           parts_to_remove_from_sep.append(sep_part)
-                 if parts_to_remove_from_sep:
-                     rocket.parts = [p for p in rocket.parts if p not in parts_to_remove_from_sep]
-                     # Update component lists if needed
-                     rocket.separators = [s for s in rocket.separators if s not in parts_to_remove_from_sep]
-                     if not rocket.parts: rocket.is_active = False
-                     else: rocket.calculate_physics_properties(); rocket.calculate_bounds()
 
-
-
-            # Check if rocket became inactive after update/separation attempt
-            if not rocket.is_active:
-                if rocket not in rockets_to_remove: rockets_to_remove.append(rocket)
-
-
-        # --- Add new rockets and remove inactive ones ---
-        if newly_created_rockets:
-            print(f"Adding {len(newly_created_rockets)} new rocket instances to simulation.")
-            # Check if control needs reassignment
+        # --- Stage 3: Apply Additions and Removals ---
+        if newly_created_rockets_this_frame:
             new_controlled_rocket_found = None
-            for nr in newly_created_rockets:
-                if nr.has_active_control:
-                    if controlled_rocket and controlled_rocket.sim_instance_id != nr.sim_instance_id:
-                         print(f"Warning: Multiple rockets claim control! Assigning to newest {nr.sim_instance_id}")
-                    new_controlled_rocket_found = nr # Assign control to the newly created primary
+            for nr in newly_created_rockets_this_frame:
+                 all_rockets.append(nr)
+                 if nr.has_active_control:
+                      if controlled_rocket and controlled_rocket not in rockets_to_remove_this_frame: print(f"Warning: Multiple control claim! New: {nr.sim_instance_id}, Old: {controlled_rocket.sim_instance_id}"); controlled_rocket.has_active_control = False
+                      new_controlled_rocket_found = nr
+            if new_controlled_rocket_found: controlled_rocket = new_controlled_rocket_found
 
-            all_rockets.extend(newly_created_rockets)
-            if new_controlled_rocket_found:
-                 controlled_rocket = new_controlled_rocket_found
-
-
-        if rockets_to_remove:
-            print(f"Removing {len(rockets_to_remove)} inactive rocket instances.")
-            was_controlled_rocket_removed = controlled_rocket in rockets_to_remove
-            all_rockets = [r for r in all_rockets if r not in rockets_to_remove]
-
+        if rockets_to_remove_this_frame:
+            was_controlled_rocket_removed = controlled_rocket in rockets_to_remove_this_frame
+            all_rockets = [r for r in all_rockets if r not in rockets_to_remove_this_frame]
             if was_controlled_rocket_removed:
-                print("Controlled rocket was removed.")
-                controlled_rocket = None
-                # Try find a new controllable rocket among remaining ones
-                for rkt in all_rockets:
-                    # Check using the original root reference stored in each instance
-                    if rkt.has_active_control or (rkt.original_root_part_ref and rkt.original_root_part_ref in rkt.parts):
-                         controlled_rocket = rkt
-                         controlled_rocket.has_active_control = True # Ensure flag is set
-                         print(f"Control transferred to rocket instance {rkt.sim_instance_id}.")
-                         break
-                if controlled_rocket is None:
-                     print("No controllable rocket remaining.")
+                print("Controlled rocket instance removed/replaced."); controlled_rocket = None
+                for rkt in all_rockets: # Find new control
+                    if rkt.has_active_control: controlled_rocket = rkt; break # Already marked?
+                if not controlled_rocket: # If not marked, find one with root
+                    for rkt in all_rockets:
+                        if rkt.original_root_part_ref and rkt.original_root_part_ref in rkt.parts and not rkt.original_root_part_ref.is_broken:
+                             controlled_rocket = rkt; controlled_rocket.has_active_control = True; break
+                if controlled_rocket: print(f"Control transferred to rocket instance {controlled_rocket.sim_instance_id}.")
+                else: print("No controllable rocket found after removals.")
 
 
-        # --- Update Camera ---
-        if controlled_rocket:
-            camera.update(controlled_rocket.get_world_com())
-        elif all_rockets:
-            # Follow the first remaining rocket if control lost
-            camera.update(all_rockets[0].get_world_com())
-        # Else: camera stays put if no rockets left
+        # --- Stage 4: Update Camera ---
+        if controlled_rocket: camera.update(controlled_rocket.get_world_com())
+        elif all_rockets: camera.update(all_rockets[0].get_world_com())
 
 
-        # --- Drawing ---
-        screen.fill(BLACK) # Or use background function
-        draw_earth_background(screen, camera, stars) # Ensure function exists
-        draw_terrain(screen, camera) # Ensure function exists
+        # --- Stage 5: Drawing ---
+        screen.fill(BLACK) # Use background function ideally
+        try: draw_earth_background(screen, camera, stars)
+        except NameError: pass
+        try: draw_terrain(screen, camera)
+        except NameError: pass
 
-        # Draw all active rockets
         total_parts_drawn = 0; total_broken_drawn = 0
         for rocket in all_rockets:
-            broken_count = rocket.draw(screen, camera)
-            total_parts_drawn += len(rocket.parts)
-            total_broken_drawn += broken_count
+            if rocket.is_active:
+                 broken_count = rocket.draw(screen, camera)
+                 total_parts_drawn += len(rocket.parts); total_broken_drawn += broken_count
 
         # --- UI Overlay ---
-        # (Draw throttle, status text for controlled_rocket or 'Destroyed' message)
-        # ... (UI drawing code remains largely the same as previous version) ...
-        # Make sure it checks if controlled_rocket exists before accessing its properties.
         if controlled_rocket:
-            # Draw UI for controlled rocket
+            # Draw UI for controlled rocket (Throttle, Status Text)
             bar_width=20; bar_height=100; bar_x=15; bar_y=SCREEN_HEIGHT-bar_height-40
-            pygame.draw.rect(screen, (50,50,50), (bar_x, bar_y, bar_width, bar_height)) # COLOR_UI_BAR_BG
+            pygame.draw.rect(screen, (50,50,50), (bar_x, bar_y, bar_width, bar_height))
             fill_height=bar_height*controlled_rocket.throttle_level
-            pygame.draw.rect(screen, (0,200,0), (bar_x, bar_y + bar_height - fill_height, bar_width, fill_height)) # COLOR_UI_BAR
+            pygame.draw.rect(screen, (0,200,0), (bar_x, bar_y + bar_height - fill_height, bar_width, fill_height))
             pygame.draw.rect(screen, WHITE, (bar_x, bar_y, bar_width, bar_height), 1)
             th_txt=ui_font.render("Thr", True, WHITE); screen.blit(th_txt, (bar_x, bar_y + bar_height + 5))
             th_val_txt = ui_font.render(f"{controlled_rocket.throttle_level * 100:.0f}%", True, WHITE); screen.blit(th_val_txt, (bar_x, bar_y - 18))
 
-            alt_agl=max(0,GROUND_Y-controlled_rocket.get_lowest_point_world().y)
-            alt_msl=GROUND_Y-controlled_rocket.get_world_com().y
+            alt_agl=max(0,GROUND_Y-controlled_rocket.get_lowest_point_world().y); alt_msl=GROUND_Y-controlled_rocket.get_world_com().y
             cs="OK" if controlled_rocket.has_active_control else "NO CONTROL"
-            mts="ON" if controlled_rocket.master_thrust_enabled else "OFF"
-            ls="LANDED" if controlled_rocket.landed else "FLYING"
+            mts="ON" if controlled_rocket.master_thrust_enabled else "OFF"; ls="LANDED" if controlled_rocket.landed else "FLYING"
             st=[f"Alt(AGL): {alt_agl:.1f}m", f"Alt(MSL): {alt_msl:.1f}m", f"Vvel: {controlled_rocket.vel.y:.1f}", f"Hvel: {controlled_rocket.vel.x:.1f}",
                 f"Speed: {controlled_rocket.vel.length():.1f}", f"Angle: {controlled_rocket.angle:.1f}", f"AngVel: {controlled_rocket.angular_velocity:.1f}",
                 f"Thr: {controlled_rocket.throttle_level*100:.0f}% [{mts}]", f"Fuel: {controlled_rocket.current_fuel:.1f}", f"Mass: {controlled_rocket.total_mass:.1f}kg",
@@ -1108,13 +1248,8 @@ def run_simulation(screen, clock, blueprint_file):
             rt_txt=ui_font.render("Press 'R' to Respawn", True, WHITE); rtr=rt_txt.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//2+40)); screen.blit(rt_txt, rtr)
 
         # FPS Counter
-        fps = clock.get_fps()
-        fps_text = ui_font.render(f"FPS: {fps:.1f}", True, WHITE)
-        screen.blit(fps_text, (SCREEN_WIDTH - 80, 10))
-        # Object Counter
-        obj_text = ui_font.render(f"Objs: {len(all_rockets)}", True, WHITE)
-        screen.blit(obj_text, (SCREEN_WIDTH - 80, 30))
-
+        fps = clock.get_fps(); fps_text = ui_font.render(f"FPS: {fps:.1f}", True, WHITE); screen.blit(fps_text, (SCREEN_WIDTH - 80, 10))
+        obj_text = ui_font.render(f"Objs: {len(all_rockets)}", True, WHITE); screen.blit(obj_text, (SCREEN_WIDTH - 80, 30))
 
         pygame.display.flip()
 
