@@ -148,26 +148,33 @@ class RocketBlueprint:
     def find_connected_subassemblies(self) -> list[list[PlacedPart]]:
         """
         Finds distinct groups of connected parts within the blueprint.
-        Uses a simple proximity check based on bounding boxes touching.
-        Returns a list of lists, where each inner list is a connected group.
+        Uses proximity check between compatible logical attachment points.
         """
-        if not self.parts:
-            return []
+        if not self.parts: return []
 
         all_parts_set = set(self.parts)
         visited = set()
         subassemblies = []
+        # How close logical points need to be to be considered connected (squared)
+        # Should be very small, allowing for slight float inaccuracies
+        CONNECTION_TOLERANCE_SQ = (2.0)**2 # e.g., 2x2 pixels squared
+
+        # Pre-calculate logical point world positions for efficiency
+        part_world_points = {}
+        for part in self.parts:
+            points = part.part_data.get("logical_points", {})
+            world_points = {}
+            for name, local_pos in points.items():
+                # Assume relative_angle is 0 for connectivity check simplicity
+                world_points[name] = part.relative_pos + local_pos.rotate(-part.relative_angle)
+            part_world_points[part] = world_points
+
 
         while len(visited) < len(self.parts):
-            # Find the next unvisited part to start a new search from
             start_node = None
-            for part in self.parts:  # Iterate in order to potentially find root first
-                if part not in visited:
-                    start_node = part
-                    break
-
-            if start_node is None:  # Should not happen if len(visited) < len(self.parts)
-                break
+            for part in self.parts: # Iterate in defined order
+                 if part not in visited: start_node = part; break
+            if start_node is None: break # Should not happen
 
             current_assembly = []
             queue = deque([start_node])
@@ -176,42 +183,87 @@ class RocketBlueprint:
             while queue:
                 current_part = queue.popleft()
                 current_assembly.append(current_part)
-                current_rect = self.get_part_bounding_box(current_part)
+                current_part_data = current_part.part_data
+                current_rules = current_part_data.get("attachment_rules", {})
+                current_points = part_world_points.get(current_part, {})
 
-                # Find neighbors (parts touching the current part)
+                # Find neighbors by checking compatible attachment points nearby
                 for other_part in all_parts_set:
                     if other_part not in visited:
-                        other_rect = self.get_part_bounding_box(other_part)
-                        # Check if bounding boxes overlap/touch (inflate slightly)
-                        if current_rect.inflate(2, 2).colliderect(other_rect):
+                        other_part_data = other_part.part_data
+                        other_rules = other_part_data.get("attachment_rules", {})
+                        other_points = part_world_points.get(other_part, {})
+
+                        # Check all pairs of logical points between current_part and other_part
+                        is_connected = False
+                        for current_point_name, current_world_pos in current_points.items():
+                            for other_point_name, other_world_pos in other_points.items():
+                                # 1. Check proximity
+                                if (current_world_pos - other_world_pos).length_squared() < CONNECTION_TOLERANCE_SQ:
+                                    # 2. Check attachment rule compatibility
+                                    # Map point names to rule names (can be helper function)
+                                    current_rule_name = self._get_rule_name_for_point(current_point_name, current_rules)
+                                    other_rule_name = self._get_rule_name_for_point(other_point_name, other_rules)
+
+                                    if current_rule_name and other_rule_name:
+                                        # Check if current allows other's type AND other allows current's type
+                                        # AND if the rules are compatible (e.g., top connects to bottom)
+                                        if self._check_rule_compatibility(current_part_data.get("type"), current_rule_name, current_rules,
+                                                                          other_part_data.get("type"), other_rule_name, other_rules):
+                                            is_connected = True
+                                            break # Found a valid connection between these parts
+                            if is_connected:
+                                break # Stop checking points for this pair
+
+                        if is_connected:
                             visited.add(other_part)
-                            queue.append(other_part)
+                            queue.append(other_part) # Add connected neighbor to queue
 
             if current_assembly:
                 subassemblies.append(current_assembly)
 
-        # Optional: Sort subassemblies (e.g., put the one with the root command pod first)
+        # --- Optional: Sort subassemblies (same as before) ---
         def sort_key(assembly):
             for part in assembly:
                 if part.part_data.get("type") == "CommandPod":
-                    # Check if it's the *original* root (parts[0] in initial list)
-                    # This assumes the original root remains parts[0] after loading/saving
                     try:
-                        if self.parts and part == self.parts[0]:
-                            return 0  # Prioritize original root
-                        else:
-                            return 1  # Other command pods next
-                    except IndexError:
-                        return 1  # Should not happen if self.parts exists
-            return 2  # Assemblies without command pods last
-
+                        if self.parts and part == self.parts[0]: return 0 # Original first part (likely root)
+                        else: return 1 # Other command pods
+                    except IndexError: return 1
+            return 2 # Assemblies without command pods
         subassemblies.sort(key=sort_key)
 
         print(f"Connectivity check found {len(subassemblies)} subassemblies.")
-        # for i, asm in enumerate(subassemblies):
-        #     print(f"  Assembly {i}: {[p.part_id for p in asm]}")
-
+        # for i, asm in enumerate(subassemblies): print(f"  Assembly {i}: {[p.part_id for p in asm]}")
         return subassemblies
+
+    # --- Helper methods for connectivity check ---
+    def _get_rule_name_for_point(self, point_name: str, rules: dict) -> str | None:
+            """ Maps a logical point name (e.g., 'bottom') to its corresponding rule name (e.g., 'bottom_center'). """
+            if "bottom" in point_name and "bottom_center" in rules: return "bottom_center"
+            if "top" in point_name and "top_center" in rules: return "top_center"
+            if "left" in point_name and "left_center" in rules: return "left_center"
+            if "right" in point_name and "right_center" in rules: return "right_center"
+            # Add more mappings if needed
+            return None
+
+    def _check_rule_compatibility(self, type1, rule_name1, rules1, type2, rule_name2, rules2) -> bool:
+            """ Checks if two attachment rules are compatible for connection. """
+            # 1. Check if each rule allows the other part's type
+            allowed1 = rules1.get(rule_name1, {}).get("allowed_types", [])
+            allowed2 = rules2.get(rule_name2, {}).get("allowed_types", [])
+            if type2 not in allowed1 or type1 not in allowed2:
+                return False
+
+            # 2. Check if the rule types themselves are compatible pairs
+            if ("top" in rule_name1 and "bottom" in rule_name2) or \
+                    ("bottom" in rule_name1 and "top" in rule_name2) or \
+                    ("left" in rule_name1 and "right" in rule_name2) or \
+                    ("right" in rule_name1 and "left" in rule_name2):
+                # Add other compatible pairs if needed (e.g., side-to-top)
+                return True
+
+            return False
 
     def save_to_json(self, filename):
         # Ensure the assets directory exists

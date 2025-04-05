@@ -7,15 +7,6 @@ import os
 # Import from the new common file
 from ui_elements import Button, STATE_MAIN_MENU, STATE_BUILDER, STATE_FLIGHT, STATE_SETTINGS, SCREEN_WIDTH, SCREEN_HEIGHT, BLACK, WHITE
 
-# --- Constants ---
-# SCREEN_WIDTH, SCREEN_HEIGHT, colors etc. are in ui_elements.py
-
-# --- Game States ---
-# Definitions moved to ui_elements.py
-
-# --- Button Class ---
-# Definition moved to ui_elements.py
-
 # --- Main Menu Function ---
 def main_menu(screen, clock):
     # Button class is now imported
@@ -82,7 +73,6 @@ def main():
             print(f"Error creating directory {assets_dir}: {e}")
             # Optionally quit if directory cannot be created
             # sys.exit(1)
-
 
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption("PySpaceFlight - Main Menu")
