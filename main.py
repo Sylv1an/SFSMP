@@ -24,7 +24,6 @@ def main_menu(screen, clock):
          # Add a "Quick Launch" button if possible
          buttons.insert(1, Button("Quick Launch Last Build", (SCREEN_WIDTH//2 - 150, 110, 300, 50), color=(100, 180, 100), hover_color=(130, 210, 130)))
 
-
     title_font = pygame.font.SysFont(None, 72)
     title_surf = title_font.render("PySpaceFlight", True, WHITE)
     title_rect = title_surf.get_rect(center=(SCREEN_WIDTH//2, 60)) # Adjusted title pos
@@ -58,7 +57,6 @@ def main_menu(screen, clock):
             button.draw(screen)
         pygame.display.flip()
         clock.tick(60)
-
 
 # --- Main Game Loop ---
 def main():
@@ -101,7 +99,6 @@ def main():
             else: # Should not happen
                  print(f"Unknown main menu result: {result}")
                  current_state = STATE_MAIN_MENU
-
 
         elif current_state == STATE_BUILDER:
              pygame.display.set_caption("PySpaceFlight - Rocket Editor")
