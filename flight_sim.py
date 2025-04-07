@@ -1751,24 +1751,44 @@ def run_multiplayer_simulation(screen, clock, local_blueprint_file, network_mgr,
 
             # --- Send Queued Network Messages ---
             while not network_send_queue.empty():
-                 try:
-                     msg_to_send = network_send_queue.get_nowait()
-                     network_mgr.send(msg_to_send) # Client sends to server
-                     # Host needs to broadcast updates (or server handles broadcast)
-                     if mp_mode == "HOST":
-                          # Broadcast ROCKET_UPDATE messages
-                          if msg_to_send.get("type") == network.MSG_TYPE_ROCKET_UPDATE:
-                               network_mgr.broadcast(msg_to_send, exclude_socket=None) # Broadcast own state
-                          # Broadcast ACTION messages as ROCKET_UPDATE
-                          elif msg_to_send.get("type") == network.MSG_TYPE_ACTION:
-                               update_msg = msg_to_send.copy()
-                               update_msg["type"] = network.MSG_TYPE_ROCKET_UPDATE
-                               # Action specific data is already in 'data' field
-                               network_mgr.broadcast(update_msg, exclude_socket=None) # Broadcast own actions
+                try:
+                    msg_to_send = network_send_queue.get_nowait()
 
-                 except queue.Empty: break
-                 except Exception as e: print(f"Error sending network message: {e}")
+                    # --- FIX: Check if Client or Host ---
+                    if mp_mode == "CLIENT":
+                        # Client sends messages directly to the server
+                        if not network_mgr.send(msg_to_send):
+                            print("Error: Failed to send message to server.")
+                            # Handle error? Break? Continue?
 
+                    elif mp_mode == "HOST":
+                        # Host processes messages from its own local rocket
+                        # These messages need to be broadcast to clients
+
+                        # Ensure host's PID (0) is set correctly
+                        msg_to_send.setdefault("pid", 0)  # Host is player 0
+
+                        # Decide *what* to broadcast based on the message type
+                        if msg_to_send.get("type") == network.MSG_TYPE_ROCKET_UPDATE:
+                            # Broadcast the state update as is
+                            network_mgr.broadcast(msg_to_send, exclude_socket=None)
+                        elif msg_to_send.get("type") == network.MSG_TYPE_ACTION:
+                            # Convert action to a ROCKET_UPDATE for broadcasting consistency
+                            update_msg = msg_to_send.copy()
+                            update_msg["type"] = network.MSG_TYPE_ROCKET_UPDATE
+                            # Action specific data is already in 'data' field
+                            network_mgr.broadcast(update_msg, exclude_socket=None)
+                        # else: # Handle other message types if host needs to broadcast them?
+                        #     print(f"Host: Ignoring message type {msg_to_send.get('type')} from local send queue.")
+
+                except queue.Empty:
+                    break
+                except AttributeError as e:
+                    print(f"Error sending network message (AttributeError): {e} - Check if calling send on Server.")
+                except Exception as e:
+                    print(f"Error processing send queue: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # --- Inter-Rocket Collision (MP) ---
             # Similar logic to SP, but uses player_rockets dict values

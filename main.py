@@ -80,7 +80,7 @@ def main_menu(screen, clock):
 # --- Settings Menu Function ---
 def settings_menu(screen, clock):
     global player_name # Allow modification
-    input_box_ip = settings.InputBox(SCREEN_WIDTH // 2 - 150, 150, 300, 40, text=settings.get_setting("host_ip"), font=input_font, max_len=40) # Allow longer for IPv6 etc.
+    input_box_ip = settings.InputBox(SCREEN_WIDTH // 2 - 150, 150, 300, 40, text=settings.get_setting("host_ip"), font=input_font, max_len=40)
     input_box_port = settings.InputBox(SCREEN_WIDTH // 2 - 150, 230, 140, 40, text=str(settings.get_setting("port")), font=input_font, max_len=5)
     input_box_name = settings.InputBox(SCREEN_WIDTH // 2 - 150, 310, 300, 40, text=settings.get_setting("player_name"), font=input_font, max_len=20)
     input_boxes = [input_box_ip, input_box_port, input_box_name]
@@ -90,33 +90,36 @@ def settings_menu(screen, clock):
 
     while True:
         mouse_pos = pygame.mouse.get_pos()
-        result = None
+        # REMOVED result = None from here
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT: return "QUIT"
             if event.type == pygame.KEYDOWN:
-                 if event.key == pygame.K_ESCAPE: return STATE_MAIN_MENU
+                 if event.key == pygame.K_ESCAPE:
+                      # Optional: Save on ESCAPE too if you want
+                      # settings.set_setting("host_ip", input_box_ip.text)
+                      # ... etc ...
+                      return STATE_MAIN_MENU
 
             # Handle input box events
             current_active = None
             for box in input_boxes:
                  box_result = box.handle_event(event)
-                 if box.active:
-                      current_active = box
-                 if box_result == "ENTER" and active_box == box: # Deactivate on enter
+                 if box.active: current_active = box
+                 if box_result == "ENTER" and active_box == box:
                       active_box.active = False
                       active_box.color = active_box.color_inactive
+                      active_box._update_text_surface() # Use internal method to update text surface
                       active_box = None
-                      break # Stop processing events for this frame after enter
+                      # Consider if break is needed here? Maybe not, allow other events.
 
             if current_active: active_box = current_active
-            else: active_box = None # Ensure active_box is None if no box is active
+            # Removed setting active_box to None here, handle_event manages activation
 
             # Handle back button click
             if back_button.is_clicked(event):
-                 result = STATE_MAIN_MENU
-
-            if result: # If back button was clicked
-                 # --- Save Settings ---
+                 # --- FIX: Moved Save and Return inside the click check ---
+                 print("Back button clicked, saving settings...")
                  settings.set_setting("host_ip", input_box_ip.text)
                  try:
                      port_val = int(input_box_port.text)
@@ -126,17 +129,20 @@ def settings_menu(screen, clock):
                  except ValueError:
                      print("Invalid port number format, keeping old value.")
                  new_pname = input_box_name.text.strip()
-                 if not new_pname: new_pname = f"Pilot_{random.randint(100,999)}" # Ensure name isn't empty
+                 # Use default name from settings if input is empty
+                 if not new_pname: new_pname = settings.DEFAULT_SETTINGS["player_name"]
                  settings.set_setting("player_name", new_pname)
                  player_name = new_pname # Update global variable if used elsewhere
-                 return result
 
+                 return STATE_MAIN_MENU # Return immediately after saving
 
-        # Update UI elements
+        # --- REMOVED the "if result:" block from outside the event loop ---
+
+        # Update UI elements (only runs if no exit event occurred)
         back_button.check_hover(mouse_pos)
-        for box in input_boxes: box.update()
+        for box in input_boxes: box.update() # InputBox update might be needed for blinking cursor later
 
-        # Draw UI
+        # --- Drawing ---
         screen.fill(BLACK)
         title_surf = title_font.render("Settings", True, WHITE)
         title_rect = title_surf.get_rect(center=(SCREEN_WIDTH//2, 60))

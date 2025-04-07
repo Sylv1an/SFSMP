@@ -298,20 +298,33 @@ class Server(NetworkBase):
 
     def _cleanup_client(self, client_socket):
         """Removes client data and notifies others."""
+        # --- FIX: Handle the host's conceptual entry (key is None) ---
+        if client_socket is None:
+            # This is the host's entry, just remove it from the dictionary
+            client_info = self.clients.pop(client_socket, None)
+            if client_info:
+                print(f"Removed host conceptual entry {client_info.get('id')}")
+            # Do not try to close socket or broadcast leave message for the host itself
+            return
+        # --- End Fix ---
+
+        # Original logic for actual client sockets:
         client_info = self.clients.pop(client_socket, None)
         self.client_handlers.pop(client_socket, None)
         try:
-            client_socket.close()
+            # Check if it's a valid socket before attempting to close
+            if hasattr(client_socket, 'close') and callable(client_socket.close):
+                client_socket.close()
         except socket.error:
-            pass # Ignore errors closing already closed socket
+            pass  # Ignore errors closing already closed socket
 
         if client_info:
             player_id = client_info['id']
             player_name = client_info['name']
             print(f"Cleaned up client {player_id} ({player_name})")
             leave_msg = {"type": MSG_TYPE_PLAYER_LEFT, "pid": player_id, "name": player_name}
-            self.message_queue.put(leave_msg) # Notify server game logic
-            self.broadcast(leave_msg) # Notify remaining clients
+            self.message_queue.put(leave_msg)  # Notify server game logic
+            self.broadcast(leave_msg)  # Notify remaining clients
 
 
     def broadcast(self, message_dict, exclude_socket=None):
