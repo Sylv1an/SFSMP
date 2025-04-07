@@ -4,6 +4,7 @@ import sys
 import flight_sim
 import builder
 import os
+import queue
 # Import from the new common file
 from ui_elements import (Button, # Removed InputBox from here
                         STATE_MAIN_MENU, STATE_BUILDER, STATE_FLIGHT, STATE_SETTINGS,
