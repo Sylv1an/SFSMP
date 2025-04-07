@@ -122,7 +122,6 @@ def main():
              if blueprint_to_launch:
                  pygame.display.set_caption(f"PySpaceFlight - Flying: {os.path.basename(blueprint_to_launch)}")
                  flight_sim.run_simulation(screen, clock, blueprint_to_launch)
-                 # Always return to menu after simulation ends (crash, escape, etc.)
                  current_state = STATE_MAIN_MENU
                  blueprint_to_launch = None # Clear blueprint after flight attempt
              else:

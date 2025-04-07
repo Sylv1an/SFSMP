@@ -23,9 +23,16 @@ PARTS_CATALOG = {
         # --- Attachments ---
         "attachment_rules": {
             "top_center": {"allowed_types": ["Parachute"]},
-            "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]}
+            "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]},
+            # *** ADDED side attachments to pod ***
+            "left_center": {"allowed_types": ["Separator"]}, # Allow radial separators
+            "right_center": {"allowed_types": ["Separator"]},
         },
-        "logical_points": {"bottom": pygame.math.Vector2(0, 12.5), "top": pygame.math.Vector2(0, -12.5)}
+        "logical_points": {
+            "bottom": pygame.math.Vector2(0, 12.5), "top": pygame.math.Vector2(0, -12.5),
+            # *** ADDED side points to pod ***
+            "left": pygame.math.Vector2(-10, 0), "right": pygame.math.Vector2(10, 0),
+        }
     },
     # ... (tank_small - WITH SIDE RULES) ...
     "tank_small": {
@@ -40,18 +47,19 @@ PARTS_CATALOG = {
         "attachment_rules": {
              "top_center": {"allowed_types": ["CommandPod", "FuelTank", "Separator"]},
              "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]},
+             # *** Side rules allow attaching radial separators OR other tanks/engines directly ***
              "left_center": {"allowed_types": ["FuelTank", "Separator", "Engine"]},
              "right_center": {"allowed_types": ["FuelTank", "Separator", "Engine"]},
         },
         "logical_points": {
             "top": pygame.math.Vector2(0, -20), "bottom": pygame.math.Vector2(0, 20),
-            "left": pygame.math.Vector2(-10, 0), "right": pygame.math.Vector2(10, 0)
+            "left": pygame.math.Vector2(-9.5, 0), "right": pygame.math.Vector2(9.5, 0) # Adjusted slightly for width 19
         }
     },
     # ... (engine_basic) ...
     "engine_basic": {
         "name": "Basic Liquid Engine", "type": "Engine", "mass": 30,
-        "thrust": 9.81 * 8 * 1500, "fuel_consumption": 0.5,
+        "thrust": 9.81 * 8 * 150, "fuel_consumption": 0.5,
         "width": 18, "height": 20, "color": (100, 100, 100),
         "max_hp": 80,
         # --- Thermal & Aero ---
@@ -61,11 +69,15 @@ PARTS_CATALOG = {
         # --- Attachments ---
         "attachment_rules": {
              "top_center": {"allowed_types": ["CommandPod", "FuelTank", "Separator"]},
-             # "left_center": {"allowed_types": ["FuelTank", "Separator"]}, # Example
+             # Allow engines to attach radially (e.g., to side of tank or radial separator)
+             "left_center": {"allowed_types": ["FuelTank", "Separator"]},
+             "right_center": {"allowed_types": ["FuelTank", "Separator"]},
         },
          "logical_points": {
              "top": pygame.math.Vector2(0, -10),
-             # "right": pygame.math.Vector2(9, 0), # Example
+             # Add side points for radial attachment
+             "left": pygame.math.Vector2(-9, 0),
+             "right": pygame.math.Vector2(9, 0),
          }
     },
     # ... (parachute_mk1) ...
@@ -86,13 +98,13 @@ PARTS_CATALOG = {
         },
         "logical_points": {"bottom": pygame.math.Vector2(0, 5)}
     },
-    # ... (separator_tr_s1) ...
+    # ... (separator_tr_s1 - Transverse) ...
     "separator_tr_s1": {
         "name": "Transverse Separator S1", "type": "Separator", "mass": 15,
         "width": 20, "height": 8, "color": (200, 200, 0), # Yellow band
         "max_hp": 60,
         "separation_force": 8000,
-        "separation_axis": "transverse",
+        "separation_axis": "transverse", # Informative tag
         "activatable": True,
         # --- Thermal & Aero ---
         "max_temp": DEFAULT_MAX_TEMP,
@@ -102,9 +114,45 @@ PARTS_CATALOG = {
         "attachment_rules": {
              "top_center": {"allowed_types": ["CommandPod", "FuelTank", "Separator"]},
              "bottom_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]},
+             # Maybe allow radial attachment *to* this?
+             "left_center": {"allowed_types": ["Separator"]},
+             "right_center": {"allowed_types": ["Separator"]},
         },
          "logical_points": {
              "top": pygame.math.Vector2(0, -4), "bottom": pygame.math.Vector2(0, 4),
+             "left": pygame.math.Vector2(-10, 0), "right": pygame.math.Vector2(10, 0),
+         }
+    },
+
+    # *** NEW RADIAL SEPARATOR ***
+    "separator_rd_s1": {
+        "name": "Radial Separator S1", "type": "Separator", "mass": 8, # Lighter than transverse?
+        "width": 8, "height": 15, # Taller than wide
+        "color": (150, 150, 255), # Light blue
+        "max_hp": 50,
+        "separation_force": 6000, # Maybe slightly less force?
+        "separation_axis": "radial", # Informative tag
+        "activatable": True,
+        # --- Thermal & Aero ---
+        "max_temp": DEFAULT_MAX_TEMP,
+        "thermal_mass": 8 * DEFAULT_THERMAL_MASS_FACTOR,
+        "base_drag_coeff": DEFAULT_DRAG_COEFF,
+        # --- Attachments ---
+        "attachment_rules": {
+             # "left_center": Attaches TO the core stack (Tank, Pod, another Separator)
+             "left_center": {"allowed_types": ["FuelTank", "CommandPod", "Separator"]},
+             # "right_center": Parts attach TO THIS side (facing outwards radially)
+             "right_center": {"allowed_types": ["FuelTank", "Engine", "Separator"]},
+             # Allow stacking radial separators vertically?
+             "top_center": {"allowed_types": ["Separator"]},
+             "bottom_center": {"allowed_types": ["Separator"]},
+        },
+         "logical_points": {
+             # Corresponds to attachment rules
+             "left": pygame.math.Vector2(-4, 0), # "Back" side attaching to core
+             "right": pygame.math.Vector2(4, 0), # "Front" side facing outwards
+             "top": pygame.math.Vector2(0, -7.5),
+             "bottom": pygame.math.Vector2(0, 7.5),
          }
     },
 }
@@ -157,17 +205,21 @@ def draw_part_shape(surface, part_data, center_pos, angle_deg=0, broken=False, d
 
 # --- Functions below remain largely unchanged ---
 
-# --- ADDED FOR GRID BUILDER ---
 # import math # Already imported
 def get_part_attachment_areas(part: 'PlacedPart', part_world_center: pygame.math.Vector2, part_world_angle: float) -> dict:
     """ Calculates the world positions of key attachment areas based on rules. """
     areas = {}; part_data = part.part_data; rules = part_data.get("attachment_rules", {}); points = part_data.get("logical_points", {})
     for area_name, rule_data in rules.items():
         point_name = None
+        # Map rule area name back to logical point name
         if area_name == "top_center": point_name = "top"
         elif area_name == "bottom_center": point_name = "bottom"
         elif area_name == "left_center": point_name = "left"
         elif area_name == "right_center": point_name = "right"
+        # *** ADDED back/front mapping for clarity, though underlying logic uses left/right ***
+        elif area_name == "back_center": point_name = "back" # If you define points named "back"
+        elif area_name == "front_center": point_name = "front" # If you define points named "front"
+
         if point_name and point_name in points:
             local_pos = points[point_name]; rotated_offset = local_pos.rotate(-part_world_angle); world_pos = part_world_center + rotated_offset
             areas[area_name] = {"world_pos": world_pos, "allowed_types": rule_data.get("allowed_types", [])}
@@ -183,10 +235,21 @@ def can_attach(part_to_place_data: dict, existing_part: 'PlacedPart', existing_p
         dist_sq = (existing_area_info["world_pos"] - target_world_pos).length_squared()
         if dist_sq < snap_distance_sq:
             if part_to_place_type in existing_area_info["allowed_types"]:
+                # Check compatibility based on rule names (top connects to bottom, left connects to right)
                 compatible_new_area = None
                 if "bottom" in existing_area_name and "top_center" in part_to_place_rules: compatible_new_area = "top_center"
                 elif "top" in existing_area_name and "bottom_center" in part_to_place_rules: compatible_new_area = "bottom_center"
                 elif "left" in existing_area_name and "right_center" in part_to_place_rules: compatible_new_area = "right_center"
                 elif "right" in existing_area_name and "left_center" in part_to_place_rules: compatible_new_area = "left_center"
-                if compatible_new_area: return existing_area_name, compatible_new_area, existing_area_info["world_pos"]
+                # Add aliases if using front/back conceptually
+                elif "front" in existing_area_name and "back_center" in part_to_place_rules: compatible_new_area = "back_center"
+                elif "back" in existing_area_name and "front_center" in part_to_place_rules: compatible_new_area = "front_center"
+
+
+                if compatible_new_area:
+                    # Final check: Does the new part allow the existing part type on its compatible area?
+                    new_part_allowed = part_to_place_rules.get(compatible_new_area, {}).get("allowed_types", [])
+                    if existing_part.part_data.get("type") in new_part_allowed:
+                        return existing_area_name, compatible_new_area, existing_area_info["world_pos"]
+
     return None, None, None
