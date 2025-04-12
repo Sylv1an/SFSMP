@@ -196,16 +196,15 @@ class FlyingRocket:
         self.pos = initial_world_com_pos - initial_com_offset_rotated
 
         # Status Flags
+        self.separators_to_fire_this_frame: list[PlacedPart] = []
         self.landed = False
-        self.thrusting = False # Is the rocket *trying* to thrust (master on, throttle > 0)
+        self.thrusting = False
         self.is_active = True
         self.pending_separation: list[PlacedPart] = []
         self.needs_structural_update = False
         self.was_landed_last_frame = False
         self.max_temp_reading = AMBIENT_TEMPERATURE
-        # Dict tracks which engines *actually* fired (had fuel)
         self.engine_firing_status: dict[PlacedPart, bool] = {e: False for e in self.engines}
-        # --- MP Change --- Last time state was sent (for client throttling)
         self.last_state_send_time = 0.0
 
     # --- Connectivity & Fuel Map Methods (Unchanged) ---
@@ -503,14 +502,13 @@ class FlyingRocket:
                 action_details = {"action": "deploy", "part_idx": part_identifier}
                 print(f"Local Activate: Deploy Parachute idx {part_identifier}")
             elif part_type == "Separator" and not clicked_part.separated:
-                # Mark visually immediately, add to pending, flag structure check
-                clicked_part.separated = True
-                if clicked_part not in self.pending_separation:
-                     self.pending_separation.append(clicked_part)
-                self.needs_structural_update = True # Flag potential split
-                action_taken = True
-                action_details = {"action": "separate", "part_idx": part_identifier}
-                print(f"Local Activate: Separate idx {part_identifier}")
+                if clicked_part not in self.separators_to_fire_this_frame:
+                    self.separators_to_fire_this_frame.append(clicked_part)
+                    action_taken = True
+                    clicked_part.separated = True
+                    self.needs_structural_update = True
+                    action_details = {"action": "separate", "part_idx": part_identifier}
+                    print(f"Local Activate: Queued Separator idx {part_identifier}")
 
         # Toggleable parts (Engines)
         if not action_taken and part_type == "Engine":
@@ -522,7 +520,6 @@ class FlyingRocket:
         # Return details for network transmission
         return action_details
 
-    # --- MP Change --- Apply Action received from network ---
     def apply_network_action(self, action_data):
         """Applies an action (deploy, toggle, etc.) received over the network."""
         action_type = action_data.get("action")
@@ -532,7 +529,13 @@ class FlyingRocket:
             print(f"Warning: Received action for invalid part index {part_idx} on rocket {self.sim_instance_id}")
             return
 
-        part = self.parts[part_idx]
+        # Find the part by index, careful not to crash if index is somehow invalid after check
+        try:
+             part = self.parts[part_idx]
+        except IndexError:
+             print(f"Error: Part index {part_idx} out of bounds for rocket {self.sim_instance_id} after check.")
+             return
+
         if part.is_broken:
              # print(f"Ignoring action '{action_type}' on broken part idx {part_idx}")
              return # Ignore actions on broken parts
@@ -542,11 +545,17 @@ class FlyingRocket:
         if action_type == "deploy" and part.part_data.get("type") == "Parachute":
             part.deployed = True
         elif action_type == "separate" and part.part_data.get("type") == "Separator":
-            # Mark visually, add to pending list for processing in main loop (by host/locally)
-            part.separated = True
-            if part not in self.pending_separation:
-                self.pending_separation.append(part)
-            self.needs_structural_update = True # Flag potential split
+             # --- Apply separation action correctly ---
+             if not part.separated: # Check if not already separated/fired
+                 # Add to the list to be processed this frame
+                 if part not in self.separators_to_fire_this_frame:
+                      self.separators_to_fire_this_frame.append(part)
+                 # Mark as separated state visually (actual structural change happens in main loop)
+                 part.separated = True
+                 # Flag that structure needs recalculation/split check
+                 self.needs_structural_update = True
+                 print(f"Network: Queued Separator idx {part_idx}")
+             # --- End Fix ---
         elif action_type == "toggle_engine" and part.part_data.get("type") == "Engine":
             part.engine_enabled = action_data.get("enabled", False)
         # --- MP Change --- Handle throttle and master thrust actions
@@ -865,7 +874,10 @@ class FlyingRocket:
                 max_temp_visual = part.part_data.get('max_temp', DEFAULT_MAX_TEMP) * REENTRY_EFFECT_MAX_TEMP_SCALE
                 heat_glow_range = max(1.0, max_temp_visual - REENTRY_EFFECT_THRESHOLD_TEMP)
                 heat_factor = max(0.0, min(1.0, (part.current_temp - REENTRY_EFFECT_THRESHOLD_TEMP) / heat_glow_range))
-            if part.is_broken: num_broken_visually += 1
+            if part.is_broken:
+                num_broken_visually += 1
+                if is_separator and part.separated:
+                    indicator_color = COLOR_ACTIVATABLE_USED
             elif is_parachute and is_activatable: indicator_color = COLOR_ACTIVATABLE_USED if part.deployed else COLOR_ACTIVATABLE_READY
             elif is_engine: indicator_color = COLOR_ENGINE_ENABLED if part.engine_enabled else COLOR_ENGINE_DISABLED
             elif is_separator and is_activatable: indicator_color = COLOR_ACTIVATABLE_USED if part.separated else COLOR_ACTIVATABLE_READY
@@ -1069,6 +1081,7 @@ def run_simulation(screen, clock, blueprint_file):
         current_sim_frame += 1
         newly_created_rockets_this_frame: list[FlyingRocket] = []
         rockets_to_remove_this_frame: list[FlyingRocket] = []
+        rockets_requiring_split_check: list[FlyingRocket] = []
 
         # --- Update Collision Grace Period ---
         pairs_to_remove_from_grace = []
@@ -1147,6 +1160,10 @@ def run_simulation(screen, clock, blueprint_file):
             rocket.update(dt, current_air_density, particle_manager, network_send_queue=None, current_time=time.time())
             if not rocket.is_active:
                  if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
+            if rocket.needs_structural_update and rocket.is_active:
+                if rocket not in rockets_requiring_split_check:
+                    rockets_requiring_split_check.append(rocket)
+                rocket.needs_structural_update = False  # Reset flag for this frame check
 
         # --- Inter-Rocket Collision (SP) ---
         collision_pairs_processed_this_frame = set()
@@ -1191,111 +1208,172 @@ def run_simulation(screen, clock, blueprint_file):
                     push_strength = 2.0; total_m = r1.total_mass + r2.total_mass
                     if total_m > 0.01: r1.pos += collision_normal*push_strength*(r2.total_mass/total_m); r2.pos -= collision_normal*push_strength*(r1.total_mass/total_m)
 
+        # --- MODIFIED: Process Connectivity Checks and Separations (SP) ---
+        split_siblings_this_frame: list[FlyingRocket] = []  # Track siblings created in this phase for grace period
+        # Iterate through rockets needing check (destruction or separation)
+        for rocket in rockets_requiring_split_check:
+                    if rocket in rockets_to_remove_this_frame or not rocket.is_active: continue
 
-        # --- Process Connectivity Checks and Separations (SP) ---
-        rockets_to_process_for_splits = list(all_rockets)
-        new_rockets_created_in_split_phase: list[FlyingRocket] = []
-        for rocket in rockets_to_process_for_splits:
-            if rocket in rockets_to_remove_this_frame or not rocket.is_active: continue
-            processed_split = False; split_siblings: list[FlyingRocket] = []
-            # Check splits from destruction
-            if rocket.needs_structural_update and not rocket.pending_separation:
-                temp_bp = RocketBlueprint(); temp_bp.parts = rocket.parts; subassemblies = temp_bp.find_connected_subassemblies()
-                if len(subassemblies) > 1:
-                    processed_split = True; print(f"[SP:{rocket.sim_instance_id}] SPLIT (Destruction) into {len(subassemblies)} pieces!")
-                    if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
-                    original_throttle = rocket.throttle_level; original_master_thrust = rocket.master_thrust_enabled
-                    for assembly_parts in subassemblies: # Create new fragments
-                        if not assembly_parts: continue
-                        try:
-                            sub_com_world = rocket.calculate_subassembly_world_com(assembly_parts)
-                            contains_root = rocket.original_root_part_ref and (rocket.original_root_part_ref in assembly_parts)
-                            is_primary = rocket.is_local_player and contains_root # Transfer control only if local player had it
-                            new_frag = FlyingRocket(list(assembly_parts), sub_com_world, rocket.angle, rocket.vel, next_sim_id, is_primary, rocket.original_root_part_ref, current_sim_frame, 0, "LocalPlayer")
-                            new_frag.angular_velocity = rocket.angular_velocity
-                            if new_frag.is_local_player: new_frag.throttle_level = original_throttle; new_frag.master_thrust_enabled = original_master_thrust
-                            new_rockets_created_in_split_phase.append(new_frag); split_siblings.append(new_frag); next_sim_id += 1
-                        except Exception as e: print(f"Error SP split(dest): {e}")
-            # Check splits from separators
-            elif rocket.pending_separation and not processed_split:
-                separators_to_process = list(rocket.pending_separation); rocket.pending_separation.clear(); split_by_sep = False
-                current_parts = list(rocket.parts); original_throttle = rocket.throttle_level; original_master_thrust = rocket.master_thrust_enabled
-                for sep_part in separators_to_process:
-                    if sep_part not in current_parts: continue
-                    sep_world_pos = rocket.get_world_part_center(sep_part); sep_force = sep_part.part_data.get("separation_force", 1000)
-                    parts_without_sep = [p for p in current_parts if p != sep_part]
-                    temp_bp = RocketBlueprint(); temp_bp.parts = parts_without_sep; subassemblies = temp_bp.find_connected_subassemblies()
-                    if len(subassemblies) > 1: # Split occurred
-                        split_by_sep = True; processed_split = True; print(f"[SP:{rocket.sim_instance_id}] SPLIT by Separator {sep_part.part_id} into {len(subassemblies)} pieces!")
-                        if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
-                        current_parts = [] # Original replaced
-                        for assembly_parts in subassemblies: # Create new pieces
-                            if not assembly_parts: continue
-                            try:
-                                sub_com_world = rocket.calculate_subassembly_world_com(assembly_parts)
-                                contains_root = rocket.original_root_part_ref and (rocket.original_root_part_ref in assembly_parts)
-                                is_primary = rocket.is_local_player and contains_root
-                                new_sep = FlyingRocket(list(assembly_parts), sub_com_world, rocket.angle, rocket.vel, next_sim_id, is_primary, rocket.original_root_part_ref, current_sim_frame, 0, "LocalPlayer")
-                                new_sep.angular_velocity = rocket.angular_velocity
-                                if new_sep.is_local_player: new_sep.throttle_level = original_throttle; new_sep.master_thrust_enabled = original_master_thrust
-                                # Apply impulse
-                                sep_vec = new_sep.get_world_com() - sep_world_pos
-                                if sep_vec.length_squared() > 1e-6: sep_dir = sep_vec.normalize()
-                                else: sep_dir = pygame.math.Vector2(0, -1).rotate(-rocket.angle + random.uniform(-5, 5))
-                                impulse_time = 0.06; impulse_mag = (sep_force / max(0.1, new_sep.total_mass)) * impulse_time
-                                new_sep.vel += sep_dir * impulse_mag
-                                new_rockets_created_in_split_phase.append(new_sep); split_siblings.append(new_sep); next_sim_id += 1
-                            except Exception as e: print(f"Error SP split(sep): {e}")
-                        break # Stop processing separators for replaced rocket
-                    else: # No split from this separator
-                        current_parts = parts_without_sep
-                        if sep_part in rocket.parts: sep_part.separated = True
-                # Update original rocket if no split occurred but parts were removed
-                if not split_by_sep and len(current_parts) < len(rocket.parts):
-                    rocket.parts = current_parts
-                    rocket.engines = [e for e in rocket.engines if e in rocket.parts]; rocket.fuel_tanks = [t for t in rocket.fuel_tanks if t in rocket.parts]
-                    rocket.parachutes = [pc for pc in rocket.parachutes if pc in rocket.parts]; rocket.separators = [s for s in rocket.separators if s in rocket.parts and s not in separators_to_process]
-                    rocket.engine_firing_status = {e: False for e in rocket.engines}
-                    if not rocket.parts: rocket.is_active = False;
-                    if rocket.is_active: rocket.needs_structural_update = True # Recalc next frame
-                    elif rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
+                    processed_split_for_this_rocket = False
+                    parts_before_check = list(rocket.parts)  # Snapshot current parts
+                    separators_fired = list(rocket.separators_to_fire_this_frame)
+                    rocket.separators_to_fire_this_frame.clear()  # Clear the list
 
-            # Add grace period for siblings (SP)
-            if split_siblings:
-                for i_sib, r_sib1 in enumerate(split_siblings):
-                    for j_sib in range(i_sib + 1, len(split_siblings)):
-                        r_sib2 = split_siblings[j_sib]; grace_pair_key = tuple(sorted((r_sib1.sim_instance_id, r_sib2.sim_instance_id)))
-                        collision_grace_period_pairs[grace_pair_key] = COLLISION_GRACE_FRAMES
-                split_siblings.clear()
+                    # Determine parts list after removing fired separators
+                    parts_after_sep_removal = [p for p in parts_before_check if p not in separators_fired]
 
-        # --- Update Rocket Lists (SP) ---
-        if new_rockets_created_in_split_phase:
+                    # Check if parts list actually changed (due to destruction OR separator firing)
+                    if len(parts_after_sep_removal) < len(parts_before_check):
+                        # Create a temporary blueprint to check connectivity
+                        temp_bp = RocketBlueprint();
+                        temp_bp.parts = parts_after_sep_removal
+                        subassemblies = temp_bp.find_connected_subassemblies()
+
+                        # --- SPLIT OCCURRED ---
+                        if len(subassemblies) > 1:
+                            processed_split_for_this_rocket = True
+                            split_cause = "Separator" if separators_fired else "Destruction"
+                            print(
+                                f"[SP:{rocket.sim_instance_id}] SPLIT ({split_cause}) into {len(subassemblies)} pieces!")
+
+                            # Mark original rocket for removal
+                            if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
+
+                            # Preserve original state if control might transfer
+                            original_throttle = rocket.throttle_level;
+                            original_master_thrust = rocket.master_thrust_enabled
+                            was_local = rocket.is_local_player
+
+                            current_split_siblings: list[FlyingRocket] = []  # Siblings from *this specific* split event
+
+                            # Create new FlyingRocket instances for each fragment
+                            for assembly_parts in subassemblies:
+                                if not assembly_parts: continue
+                                try:
+                                    # Calculate CoM of the fragment based on its parts relative to original rocket origin
+                                    sub_com_world = rocket.calculate_subassembly_world_com(assembly_parts)
+                                    contains_root = rocket.original_root_part_ref and (
+                                                rocket.original_root_part_ref in assembly_parts)
+                                    is_primary = was_local and contains_root  # Transfer control only if local player had it AND this piece has root
+
+                                    # Create the new rocket fragment
+                                    new_frag = FlyingRocket(
+                                        parts_list=list(assembly_parts), initial_world_com_pos=sub_com_world,
+                                        initial_angle=rocket.angle, initial_vel=pygame.math.Vector2(rocket.vel),
+                                        # Copy velocity
+                                        sim_instance_id=next_sim_id, is_primary_control=is_primary,
+                                        original_root_ref=rocket.original_root_part_ref,  # Keep original root ref
+                                        current_frame=current_sim_frame, player_id=0, player_name="LocalPlayer"
+                                    )
+                                    new_frag.angular_velocity = rocket.angular_velocity  # Copy angular velocity
+                                    if new_frag.is_local_player:  # Apply preserved controls if it's the new primary
+                                        new_frag.throttle_level = original_throttle;
+                                        new_frag.master_thrust_enabled = original_master_thrust
+
+                                    # Apply separation impulse if split by separator
+                                    if separators_fired:
+                                        # Find the separator most likely responsible for this fragment's separation
+                                        # (Simplification: average position of fired separators)
+                                        if len(separators_fired) > 0:
+                                            sep_world_pos_avg = pygame.math.Vector2(0, 0)
+                                            for sep in separators_fired: sep_world_pos_avg += rocket.get_world_part_center(
+                                                sep)
+                                            sep_world_pos_avg /= len(separators_fired)
+                                            sep_force = separators_fired[0].part_data.get("separation_force",
+                                                                                          1000)  # Use first separator's force
+
+                                            sep_vec = new_frag.get_world_com() - sep_world_pos_avg
+                                            if sep_vec.length_squared() > 1e-6:
+                                                sep_dir = sep_vec.normalize()
+                                            else:
+                                                sep_dir = pygame.math.Vector2(random.uniform(-1, 1), random.uniform(-1,
+                                                                                                                    1)).normalize()  # Random push if coincident
+
+                                            impulse_time = 0.05  # Shorter impulse duration
+                                            impulse_mag = (sep_force / max(0.1, new_frag.total_mass)) * impulse_time
+                                            new_frag.vel += sep_dir * impulse_mag
+                                            # Add small random angular impulse too
+                                            new_frag.angular_velocity += random.uniform(-15, 15)
+
+                                    newly_created_rockets_this_frame.append(new_frag)
+                                    current_split_siblings.append(new_frag)  # Add to siblings for this event
+                                    next_sim_id += 1
+                                except Exception as e:
+                                    print(f"Error SP creating split fragment: {e}")
+
+                            # Add siblings from this event to the frame's list
+                            split_siblings_this_frame.extend(current_split_siblings)
+
+                        # --- NO SPLIT, but parts were removed (e.g., end cap separator) ---
+                        elif not processed_split_for_this_rocket:  # Check flag again
+                            if separators_fired:  # Only update if separators were involved
+                                print(f"[SP:{rocket.sim_instance_id}] Separator fired but no structural split.")
+                                # Update the original rocket's part list
+                                rocket.parts = parts_after_sep_removal
+                                # Rebuild internal component lists and physics properties
+                                rocket.engines = [e for e in rocket.engines if e in rocket.parts]
+                                rocket.fuel_tanks = [t for t in rocket.fuel_tanks if t in rocket.parts]
+                                rocket.parachutes = [pc for pc in rocket.parachutes if pc in rocket.parts]
+                                rocket.separators = [s for s in rocket.separators if
+                                                     s in rocket.parts]  # Remove fired ones
+                                rocket.engine_firing_status = {e: False for e in rocket.engines}
+                                rocket._build_fuel_source_map()  # Rebuild fuel map
+                                rocket.calculate_physics_properties()  # Recalculate mass, CoM, MoI
+                                rocket.calculate_bounds()
+                                # Mark the fired separators as 'separated' visually (though removed from list)
+                                for sep in separators_fired: sep.separated = True
+                                if not rocket.parts:  # Check if rocket is now empty
+                                    rocket.is_active = False
+                                    if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(
+                                        rocket)
+
+        # --- Add Collision Grace Period for New Siblings ---
+        if split_siblings_this_frame:
+            for i_sib, r_sib1 in enumerate(split_siblings_this_frame):
+                for j_sib in range(i_sib + 1, len(split_siblings_this_frame)):
+                    r_sib2 = split_siblings_this_frame[j_sib]
+                    grace_pair_key = tuple(sorted((r_sib1.sim_instance_id, r_sib2.sim_instance_id)))
+                    collision_grace_period_pairs[grace_pair_key] = COLLISION_GRACE_FRAMES
+            split_siblings_this_frame.clear()  # Clear after processing
+
+            # --- Update Rocket Lists (SP) ---
+        if newly_created_rockets_this_frame:
+            # ... (logic for adding new rockets and handling control transfer remains the same) ...
             new_ctrl_candidate = None
-            for new_rocket in new_rockets_created_in_split_phase:
-                 if new_rocket not in all_rockets: all_rockets.append(new_rocket)
-                 if new_rocket.is_local_player: new_ctrl_candidate = new_rocket # If a new local player rocket was created
-            if new_ctrl_candidate: # If control transferred
-                 if controlled_rocket and controlled_rocket not in rockets_to_remove_this_frame:
-                      controlled_rocket.is_local_player = False # Mark old one as non-local if it still exists
-                 controlled_rocket = new_ctrl_candidate # Assign new controlled rocket
-            new_rockets_created_in_split_phase.clear()
+            for new_rocket in newly_created_rockets_this_frame:
+                if new_rocket not in all_rockets: all_rockets.append(new_rocket)
+                if new_rocket.is_local_player: new_ctrl_candidate = new_rocket  # If a new local player rocket was created
+            if new_ctrl_candidate:  # If control transferred
+                if controlled_rocket and controlled_rocket not in rockets_to_remove_this_frame:
+                    controlled_rocket.is_local_player = False  # Mark old one as non-local if it still exists
+                controlled_rocket = new_ctrl_candidate  # Assign new controlled rocket
+            newly_created_rockets_this_frame.clear()
 
         if rockets_to_remove_this_frame:
+            # ... (logic for removing rockets and cleaning grace period remains the same) ...
             was_controlled_removed = controlled_rocket in rockets_to_remove_this_frame
             removed_ids = {r.sim_instance_id for r in rockets_to_remove_this_frame}
             # Clean grace period
-            pairs_to_del_grace = [pair for pair in collision_grace_period_pairs if pair[0] in removed_ids or pair[1] in removed_ids]
+            pairs_to_del_grace = [pair for pair in collision_grace_period_pairs if
+                                  pair[0] in removed_ids or pair[1] in removed_ids]
             for pair in pairs_to_del_grace:
-                 if pair in collision_grace_period_pairs: del collision_grace_period_pairs[pair]
+                if pair in collision_grace_period_pairs: del collision_grace_period_pairs[pair]
             # Filter list
             all_rockets = [r for r in all_rockets if r not in rockets_to_remove_this_frame]
             rockets_to_remove_this_frame.clear()
-            if was_controlled_removed: # Find new control if possible
+            if was_controlled_removed:  # Find new control if possible
                 controlled_rocket = None
+                # --- FIXED: Iterate through potentially updated all_rockets list ---
                 for rkt in all_rockets:
+                    # Check if it still has its original root part and is active
                     root_ref = rkt.original_root_part_ref
-                    if root_ref and root_ref in rkt.parts and not root_ref.is_broken:
-                        controlled_rocket = rkt; controlled_rocket.is_local_player = True; break
+                    if rkt.is_active and root_ref and root_ref in rkt.parts and not root_ref.is_broken:
+                        controlled_rocket = rkt
+                        controlled_rocket.is_local_player = True
+                        print(f"Control transferred to SimID {rkt.sim_instance_id} after original was removed.")
+                        break
+                if controlled_rocket is None:
+                    print("Lost control: Original rocket removed and no suitable fragment found.")
 
         # --- Camera Update (SP) ---
         if controlled_rocket: camera.update(controlled_rocket.get_world_com())
@@ -1367,38 +1445,31 @@ def run_multiplayer_simulation(screen, clock, local_blueprint_file, network_mgr,
     local_player_name = network_mgr.player_name
 
     # --- Game State Variables ---
-    # Store rockets by player ID for easy lookup
-    player_rockets: dict[int, FlyingRocket] = {}
-    # Store blueprint JSON strings received from network
+    player_rockets: dict[int, FlyingRocket] = {} # Stores primary/controlled rocket per player
     player_blueprints: dict[int, str] = {}
-    # Store player names received
-    player_names: dict[int, str] = {local_player_id: local_player_name} # Start with local player
-    # Track readiness (received blueprint AND launch ready signal)
-    player_ready_status: dict[int, bool] = {} # pid -> is_ready
-    # Track connection status (for lobby-like waiting)
-    connected_players: dict[int, str] = {local_player_id: local_player_name} # Start with self
+    player_names: dict[int, str] = {local_player_id: local_player_name}
+    player_ready_status: dict[int, bool] = {}
+    connected_players: dict[int, str] = {local_player_id: local_player_name}
+    all_sim_rockets: list[FlyingRocket] = [] # List of ALL active rockets/fragments
 
     # --- Simulation Phase Flags ---
-    # Phase 1: Waiting for players, blueprints, ready signals
-    # Phase 2: Active simulation loop
-    current_phase = "WAITING" # Can be "WAITING", "RUNNING", "ENDED"
-    all_players_ready = False # Flag to start simulation
+    current_phase = "WAITING"
+    all_players_ready = False
 
-    # Load local blueprint string (sent earlier, but load again for consistency)
+    # Load local blueprint
     try:
         with open(local_blueprint_file, 'r') as f:
             player_blueprints[local_player_id] = f.read()
-        player_ready_status[local_player_id] = True # Mark local player as ready (blueprint sent from builder)
+        player_ready_status[local_player_id] = True
         print(f"Local player {local_player_id} blueprint loaded and marked ready.")
     except Exception as e:
         print(f"FATAL ERROR: Could not load local blueprint '{local_blueprint_file}' for MP: {e}")
-        # Send error to network? Exit?
         if network_mgr: network_mgr.stop()
-        return # Exit simulation
+        return
 
-    # Simulation Setup (Camera, Stars, Particles, UI)
+    # Simulation Setup
     camera = Camera(SCREEN_WIDTH, SCREEN_HEIGHT)
-    camera.update(pygame.math.Vector2(0, GROUND_Y - SCREEN_HEIGHT // 3)) # Initial view
+    camera.update(pygame.math.Vector2(0, GROUND_Y - SCREEN_HEIGHT // 3))
     try:
         star_area_bounds = pygame.Rect(-WORLD_WIDTH*2, SPACE_Y_LIMIT - STAR_FIELD_DEPTH, WORLD_WIDTH*4, abs(SPACE_Y_LIMIT) + GROUND_Y + STAR_FIELD_DEPTH * 1.5)
         stars = create_stars(STAR_COUNT, star_area_bounds)
@@ -1407,56 +1478,38 @@ def run_multiplayer_simulation(screen, clock, local_blueprint_file, network_mgr,
     particle_manager = ParticleManager()
 
     # Multiplayer Specific Setup
-    network_send_queue = queue.Queue() # Queue for messages to be sent by network thread (used by local rocket update)
+    network_send_queue = queue.Queue()
     sim_running = True
     current_sim_frame = 0
     last_ping_time = time.time()
     collision_grace_period_pairs: dict[tuple[int, int], int] = {}
-    next_sim_id_counter = 0 # Local counter for assigning sim_instance_id to rockets created
+    next_sim_id_counter = 0
 
     # --- Helper: Function to create rocket from blueprint string ---
     def create_rocket_instance(player_id, bp_json_str, name, sim_id, frame):
+        # (This function remains the same as provided previously)
         try:
-            # Load blueprint from the JSON string
             bp_data = json.loads(bp_json_str)
             temp_blueprint = RocketBlueprint(bp_data.get("name", f"Player_{player_id}_Rocket"))
             temp_blueprint.parts = [PlacedPart.from_dict(part_data) for part_data in bp_data.get("parts", [])]
-            if not temp_blueprint.parts:
-                print(f"Warning: Blueprint for player {player_id} is empty.")
-                return None
-
-            # Find connected components (usually just one expected)
+            if not temp_blueprint.parts: return None
             subassemblies = temp_blueprint.find_connected_subassemblies()
-            if not subassemblies or not subassemblies[0]:
-                print(f"Error: No connected parts in blueprint for player {player_id}.")
-                return None
-            assembly_parts = subassemblies[0] # Assume first assembly is the main one
-
-            # Determine spawn position based on player ID order (simple horizontal layout)
-            # Sort current player IDs to get a consistent order
+            if not subassemblies or not subassemblies[0]: return None
+            assembly_parts = subassemblies[0]
             sorted_pids = sorted(connected_players.keys())
             try: player_spawn_index = sorted_pids.index(player_id)
-            except ValueError: player_spawn_index = len(sorted_pids) # Append new players
-
+            except ValueError: player_spawn_index = len(sorted_pids)
             start_x = player_spawn_index * MP_LAUNCHPAD_SPACING
-
-            # Calculate spawn Y based on lowest point (same as SP)
             temp_bp_for_calc = RocketBlueprint(); temp_bp_for_calc.parts = assembly_parts
             initial_com_local = temp_bp_for_calc.calculate_subassembly_world_com(assembly_parts)
             lowest_offset_y = temp_bp_for_calc.get_lowest_point_offset_y()
-            start_y_for_origin = GROUND_Y - lowest_offset_y # Spawn on ground
+            start_y_for_origin = GROUND_Y - lowest_offset_y
             target_initial_com_pos = pygame.math.Vector2(start_x, start_y_for_origin + initial_com_local.y)
-
-            # Determine if this is the locally controlled rocket
             is_local = (player_id == local_player_id)
-
-            # Find original root reference within this specific assembly
             root_ref = None
             for part in assembly_parts:
                  if part.part_data and part.part_data.get("type") == "CommandPod": root_ref = part; break
             if not root_ref and assembly_parts: root_ref = assembly_parts[0]
-
-            # Create the FlyingRocket instance
             rocket = FlyingRocket(
                 parts_list=list(assembly_parts), initial_world_com_pos=target_initial_com_pos,
                 initial_angle=0, initial_vel=pygame.math.Vector2(0,0), sim_instance_id=sim_id,
@@ -1469,639 +1522,586 @@ def run_multiplayer_simulation(screen, clock, local_blueprint_file, network_mgr,
         except Exception as e: print(f"Error creating rocket instance for player {player_id}: {e}"); import traceback; traceback.print_exc()
         return None
 
+
     # --- Main Multiplayer Loop ---
     while sim_running:
         current_time = time.time()
         dt = min(clock.tick(60) / 1000.0, 0.05)
         current_sim_frame += 1
 
-        # Lists for managing rockets during the frame
         newly_created_rockets_this_frame: list[FlyingRocket] = []
         rockets_to_remove_this_frame: list[FlyingRocket] = []
-        rocket_splits_this_frame: list[FlyingRocket] = [] # Track original rockets that split
+        rockets_requiring_split_check: list[FlyingRocket] = []
 
         # --- Network Message Processing ---
         while not network_mgr.message_queue.empty():
             try:
                 msg = network_mgr.message_queue.get_nowait()
                 msg_type = msg.get("type")
-                sender_pid = msg.get("pid") # Player ID who sent/caused the message
+                sender_pid = msg.get("pid")  # Player ID who sent/caused the message
 
                 # print(f"MP Sim RX ({mp_mode}): {msg}") # Debug all messages
 
                 if msg_type == network.MSG_TYPE_ERROR:
                     print(f"!!! Network Error: {msg.get('data')} !!!")
-                    # Decide how to handle: show message, disconnect, etc.
-                    # For now, just print and continue, maybe disconnect later.
                     # sim_running = False # Option: Stop sim on critical error
 
                 elif msg_type == network.MSG_TYPE_PLAYER_JOINED:
-                    pid = msg.get("pid")
+                    pid = msg.get("pid");
                     name = msg.get("name", f"Player_{pid}")
-                    if pid != local_player_id: # Don't add self again
-                        connected_players[pid] = name
+                    if pid != local_player_id:
+                        connected_players[pid] = name;
                         player_names[pid] = name
-                        player_ready_status[pid] = False # Assume not ready until blueprint/ready signal received
+                        player_ready_status[pid] = False
                         print(f"Player {pid} ({name}) joined.")
-                        # If already running, host needs to send current game state to new player
                         if current_phase == "RUNNING" and mp_mode == "HOST":
-                            # Gather state from all *other* rockets
                             game_state = {}
-                            for other_pid, rocket in player_rockets.items():
-                                if other_pid != pid and rocket.is_active: # Exclude the new player and inactive rockets
-                                    game_state[other_pid] = rocket.get_state()
-                            state_msg = {"type": network.MSG_TYPE_GAME_STATE, "state": game_state}
-                            # Find the socket for the new player to send directly (Server only)
-                            target_socket = None
-                            for sock, info in network_mgr.clients.items():
-                                if info['id'] == pid: target_socket = sock; break
+                            for other_rocket in all_sim_rockets:  # Send state of ALL rockets/debris
+                                if other_rocket.is_active:
+                                    # Use sim_instance_id as key? Or PID + fragment ID? Let's use SimID for now.
+                                    # --- ADD player_id to state data ---
+                                    state_data = other_rocket.get_state()
+                                    state_data['player_id'] = other_rocket.player_id # Ensure PID is included
+                                    game_state[other_rocket.sim_instance_id] = state_data
+                                    # --- End Add ---
+                            state_msg = {"type": network.MSG_TYPE_GAME_STATE, "state": game_state,
+                                         "blueprints": player_blueprints}  # Include blueprints
+                            target_socket = next(
+                                (sock for sock, info in network_mgr.clients.items() if info['id'] == pid), None)
                             if target_socket:
-                                 network_mgr.send_message(target_socket, state_msg)
-                                 print(f"Sent current game state to joining player {pid}.")
-                            else: print(f"Error: Could not find socket for joining player {pid} to send state.")
-
+                                network_mgr.send_message(target_socket, state_msg); print(
+                                    f"Sent game state & BPs to player {pid}.")
+                            else:
+                                print(f"Error: Could not find socket for player {pid} to send state.")
 
                 elif msg_type == network.MSG_TYPE_PLAYER_LEFT:
-                    pid = msg.get("pid")
+                    pid = msg.get("pid");
                     name = player_names.get(pid, f"Player_{pid}")
                     print(f"Player {pid} ({name}) left.")
-                    connected_players.pop(pid, None)
+                    connected_players.pop(pid, None);
                     player_names.pop(pid, None)
-                    player_blueprints.pop(pid, None)
+                    player_blueprints.pop(pid, None);
                     player_ready_status.pop(pid, None)
-                    rocket_to_remove = player_rockets.pop(pid, None)
-                    if rocket_to_remove and rocket_to_remove not in rockets_to_remove_this_frame:
-                        rockets_to_remove_this_frame.append(rocket_to_remove)
-                    # Check if all players are ready again if someone leaves during waiting
+                    # Find all rockets belonging to this player and mark for removal
+                    rockets_of_player = [r for r in all_sim_rockets if r.player_id == pid]
+                    for r in rockets_of_player:
+                        if r not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(r)
+                    if pid in player_rockets: del player_rockets[pid]  # Remove primary reference
                     if current_phase == "WAITING": all_players_ready = False
 
-
                 elif msg_type == network.MSG_TYPE_BLUEPRINT:
-                     pid = msg.get("pid")
-                     bp_json = msg.get("json_str")
-                     name = msg.get("name", f"Player_{pid}") # Use name from message if provided
-                     bp_name = msg.get("bp_name", "Unknown Rocket")
-                     print(f"Received blueprint for Player {pid} ({name}) - Rocket: {bp_name}")
-                     if pid not in player_blueprints and bp_json:
-                         player_blueprints[pid] = bp_json
-                         player_names[pid] = name # Update name if sent with blueprint
-                         if pid not in connected_players: connected_players[pid] = name # Add if joined silently
-                         # If already running, create the rocket immediately
-                         if current_phase == "RUNNING":
-                              sim_id = next_sim_id_counter; next_sim_id_counter += 1
-                              new_rocket = create_rocket_instance(pid, bp_json, name, sim_id, current_sim_frame)
-                              if new_rocket:
-                                   player_rockets[pid] = new_rocket
-                                   # Host needs to broadcast the creation/state of this new rocket? Or rely on state sync?
-                         # Else, wait for ready signal / launch phase
+                    pid = msg.get("pid");
+                    bp_json = msg.get("json_str");
+                    name = msg.get("name", f"Player_{pid}");
+                    bp_name = msg.get("bp_name", "Unknown Rocket")
+                    print(f"Received blueprint for Player {pid} ({name}) - Rocket: {bp_name}")
+                    if pid not in player_blueprints and bp_json:
+                        player_blueprints[pid] = bp_json;
+                        player_names[pid] = name
+                        if pid not in connected_players: connected_players[pid] = name
+                        if current_phase == "RUNNING":  # Late join: create rocket now
+                            sim_id = next_sim_id_counter;
+                            next_sim_id_counter += 1
+                            new_rocket = create_rocket_instance(pid, bp_json, name, sim_id, current_sim_frame)
+                            if new_rocket:
+                                player_rockets[pid] = new_rocket  # Store as primary
+                                newly_created_rockets_this_frame.append(new_rocket)  # Add to simulation list
+                                # Host should broadcast creation? Or rely on state sync? Rely on sync for now.
 
                 elif msg_type == network.MSG_TYPE_LAUNCH_READY:
-                    pid = msg.get("pid")
+                    pid = msg.get("pid");
                     print(f"Player {pid} signalled Launch Ready.")
-                    if pid in connected_players:
-                        player_ready_status[pid] = True
-                    # Check if everyone is ready only during the WAITING phase
-                    if current_phase == "WAITING": all_players_ready = False # Recalculate readiness
-
+                    if pid in connected_players: player_ready_status[pid] = True
+                    if current_phase == "WAITING": all_players_ready = False
 
                 elif msg_type == network.MSG_TYPE_ROCKET_UPDATE:
-                    pid = msg.get("pid")
-                    action = msg.get("action")
+                    pid = msg.get("pid");
+                    action = msg.get("action");
                     data = msg.get("data")
-                    rocket = player_rockets.get(pid)
-                    if rocket and not rocket.is_local_player: # Apply only to remote rockets
+                    # Find the relevant rocket instance (could be primary or debris)
+                    # Need to identify rocket uniquely - use sim_instance_id?
+                    target_sim_id = data.get("sim_id", None)  # Assume state updates might include sim_id
+                    target_rocket = None
+                    if target_sim_id is not None:
+                        target_rocket = next((r for r in all_sim_rockets if r.sim_instance_id == target_sim_id), None)
+                    # --- Fallback REMOVED: Actions/states should target specific SimIDs ---
+                    # else: target_rocket = player_rockets.get(pid)
+
+                    if target_rocket and not target_rocket.is_local_player:  # Apply only to remote rockets
                         if action == "state_update":
-                            rocket.apply_state(data)
+                            target_rocket.apply_state(data)
                         else:
-                            # Assume other actions (deploy, toggle, etc.) are in 'data'
-                            action_data = data # The 'data' field contains the action specifics
-                            rocket.apply_network_action(action_data)
-                    # elif not rocket: print(f"Warning: Received update for unknown rocket PID {pid}") # Less verbose
+                            target_rocket.apply_network_action(data)  # Assumes 'data' contains action details
+                    # elif not target_rocket: print(f"Warning: ROCKET_UPDATE for unknown SimID {target_sim_id} or PID {pid}") # Reduce log spam
 
-
-                elif msg_type == network.MSG_TYPE_GAME_STATE: # Client receives full state on join
+                elif msg_type == network.MSG_TYPE_GAME_STATE:  # Client receives full state on join
                     if mp_mode == "CLIENT":
-                         print("Received initial game state.")
-                         state_map = msg.get("state", {})
-                         for pid_str, state_data in state_map.items():
-                              pid = int(pid_str)
-                              if pid != local_player_id: # Don't apply to self
-                                   # Check if blueprint exists for this player
-                                   bp_json = player_blueprints.get(pid)
-                                   if bp_json and pid not in player_rockets:
-                                       # Create the rocket first
-                                       sim_id = next_sim_id_counter; next_sim_id_counter += 1
-                                       name = player_names.get(pid, f"Player_{pid}")
-                                       new_rocket = create_rocket_instance(pid, bp_json, name, sim_id, current_sim_frame)
-                                       if new_rocket:
-                                            player_rockets[pid] = new_rocket
-                                            # Now apply the received state
-                                            new_rocket.apply_state(state_data)
-                                            print(f"Created and applied state for existing player {pid}")
-                                   elif pid in player_rockets:
-                                        # Rocket already exists, just apply state
-                                        player_rockets[pid].apply_state(state_data)
-                                        print(f"Applied game state update to existing player {pid}")
-                                   # else: print(f"Warning: Received game state for player {pid} but no blueprint.")
+                        print("Received initial game state.");
+                        state_map = msg.get("state", {});
+                        received_bps = msg.get("blueprints", {})
+                        player_blueprints.update(received_bps)  # Update known blueprints
+                        # Clear existing rockets before applying state? Yes.
+                        all_sim_rockets.clear();
+                        player_rockets.clear()
+                        for sim_id_str, state_data in state_map.items():
+                            sim_id = int(sim_id_str);
+                            # --- Retrieve PID from state_data ---
+                            pid = state_data.get("player_id") # Assume get_state now includes player_id
+                            if pid is None: print(f"Warning: Game state missing PID for SimID {sim_id}"); continue
+                            # --- End PID Retrieve ---
+                            bp_json = player_blueprints.get(pid)
+                            if bp_json:
+                                name = player_names.get(pid, f"Player_{pid}")
+                                # Create instance - it might already exist conceptually, but easier to recreate
+                                rocket = create_rocket_instance(pid, bp_json, name, sim_id,
+                                                                current_sim_frame)  # Use sim_id from state
+                                if rocket:
+                                    # --- ADD player_id to state BEFORE applying ---
+                                    # Apply state needs the PID, but it might not be in the nested state dict
+                                    # It's better if get_state() includes it *within* the state dict itself.
+                                    # Assuming apply_state can handle it being missing for now.
+                                    rocket.apply_state(state_data)  # Apply the state *after* creation
+                                    all_sim_rockets.append(rocket)
+                                    # Track primary rocket reference if it's local or first for this player
+                                    if rocket.is_local_player or pid not in player_rockets:
+                                        player_rockets[pid] = rocket
+                                    # print(f"Created/Applied state for SimID {sim_id} (Player {pid})") # Reduce spam
+                            # else: print(f"Warning: Received state for Player {pid} but no blueprint found.")
+                        print("Finished processing initial game state.")
 
 
-                # Handle other message types if needed (e.g., SET_NAME)
                 elif msg_type == network.MSG_TYPE_SET_NAME:
-                     pid = msg.get("pid")
-                     name = msg.get("name")
-                     if pid in player_names: player_names[pid] = name
-                     if pid in connected_players: connected_players[pid] = name
-                     if pid in player_rockets: player_rockets[pid].player_name = name
-                     print(f"Updated name for Player {pid} to '{name}'")
-
+                    pid = msg.get("pid");
+                    name = msg.get("name")
+                    if pid in player_names: player_names[pid] = name
+                    if pid in connected_players: connected_players[pid] = name
+                    if pid in player_rockets: player_rockets[pid].player_name = name
+                    # Update name for all fragments of this player too
+                    for r in all_sim_rockets:
+                        if r.player_id == pid: r.player_name = name
+                    print(f"Updated name for Player {pid} to '{name}'")
 
             except queue.Empty:
-                break # No more messages in queue for now
+                break
             except Exception as e:
-                print(f"Error processing network message: {e}")
-                import traceback
-                traceback.print_exc()
-
+                print(f"Error processing network message: {e}"); import traceback; traceback.print_exc()
 
         # --- Phase Logic ---
         if current_phase == "WAITING":
-            # Check if all connected players have sent blueprint and ready signal
-            all_players_ready = True
-            if not connected_players: all_players_ready = False # Need at least one player
+            all_players_ready = bool(connected_players)
             for pid in connected_players:
-                 # Check if blueprint received AND ready signal received
-                 if pid not in player_blueprints or not player_ready_status.get(pid, False):
-                     all_players_ready = False
-                     break
-
+                if pid not in player_blueprints or not player_ready_status.get(pid, False):
+                    all_players_ready = False;
+                    break
             if all_players_ready:
-                print("All players ready! Creating rockets and starting simulation...")
+                print("All players ready! Creating rockets and starting simulation...");
                 current_phase = "RUNNING"
-                # Create rocket instances for all players now
-                player_rockets.clear() # Clear any previous instances
-                next_sim_id_counter = 0 # Reset sim ID counter for this launch
+                player_rockets.clear();
+                all_sim_rockets.clear()
+                next_sim_id_counter = 0
                 for pid, bp_json in player_blueprints.items():
-                    if pid in connected_players: # Only create for currently connected players
-                         sim_id = next_sim_id_counter; next_sim_id_counter += 1
-                         name = player_names.get(pid, f"Player_{pid}")
-                         rocket = create_rocket_instance(pid, bp_json, name, sim_id, current_sim_frame)
-                         if rocket:
-                             player_rockets[pid] = rocket
-                         else:
-                             print(f"Failed to create rocket for player {pid} at launch!")
-                             # Handle this error? Kick player? Abort launch?
-                             current_phase = "WAITING" # Go back to waiting if creation fails
-                             all_players_ready = False
-                             break # Stop creating rockets
-
-                # Set initial camera position based on local player's rocket
+                    if pid in connected_players:
+                        sim_id = next_sim_id_counter;
+                        next_sim_id_counter += 1
+                        name = player_names.get(pid, f"Player_{pid}")
+                        rocket = create_rocket_instance(pid, bp_json, name, sim_id, current_sim_frame)
+                        if rocket:
+                            player_rockets[pid] = rocket
+                            all_sim_rockets.append(rocket)
+                        else:
+                            print(f"Failed to create rocket for player {pid} at launch!");
+                            current_phase = "WAITING";
+                            all_players_ready = False;
+                            break
                 local_rocket = player_rockets.get(local_player_id)
                 if local_rocket:
-                     camera.update(local_rocket.get_world_com())
-                elif player_rockets: # Fallback to first rocket if local failed
-                     camera.update(list(player_rockets.values())[0].get_world_com())
+                    camera.update(local_rocket.get_world_com())
+                elif all_sim_rockets:
+                    camera.update(all_sim_rockets[0].get_world_com())
 
 
         elif current_phase == "RUNNING":
             # --- Local Player Input Handling ---
             local_rocket = player_rockets.get(local_player_id)
             if local_rocket and local_rocket.is_active:
-                # Check root part status for control
-                root_ref = local_rocket.original_root_part_ref
-                can_control_locally = (root_ref is not None) and (root_ref in local_rocket.parts) and (not root_ref.is_broken)
-
-                # Event-based input (handled once per frame)
+                root_ref = local_rocket.original_root_part_ref;
+                can_control_locally = (root_ref is not None) and (root_ref in local_rocket.parts) and (
+                    not root_ref.is_broken)
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT: sim_running = False; break
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_ESCAPE: sim_running = False; break
                         if can_control_locally:
-                            # Master Thrust Toggle
                             if event.key == pygame.K_SPACE:
                                 local_rocket.master_thrust_enabled = not local_rocket.master_thrust_enabled
-                                # Send action immediately
-                                action_msg = {"action": "set_master_thrust", "value": local_rocket.master_thrust_enabled}
-                                network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id, "data": action_msg})
-
-                            # Deploy All Parachutes
+                                action_msg = {"action": "set_master_thrust",
+                                              "value": local_rocket.master_thrust_enabled,
+                                              "sim_id": local_rocket.sim_instance_id} # Add SimID
+                                network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id,
+                                                        "data": action_msg})  # Send player action
                             if event.key == pygame.K_p:
-                                chutes_activated = []
-                                for i, chute in enumerate(local_rocket.parachutes):
+                                chutes_activated_indices = []
+                                for chute in local_rocket.parachutes:
                                     if not chute.deployed and not chute.is_broken:
-                                        chute.deployed = True # Apply locally first
-                                        chutes_activated.append(i) # Send indices of activated chutes
-                                if chutes_activated:
-                                     # Send one message with all activated chute indices?
-                                     # Or send individual messages? Individual is simpler to handle.
-                                     for chute_idx_in_list in chutes_activated:
-                                         # Find the original part index
-                                         original_part_idx = local_rocket.parachutes[chute_idx_in_list].part_index
-                                         action_msg = {"action": "deploy", "part_idx": original_part_idx}
-                                         network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id, "data": action_msg})
-                                     print(f"Sent deploy actions for {len(chutes_activated)} chutes.")
-
-                    # Part Activation Click
+                                        chute.deployed = True;
+                                        chutes_activated_indices.append(chute.part_index)
+                                if chutes_activated_indices:
+                                    for part_idx in chutes_activated_indices:
+                                        action_msg = {"action": "deploy", "part_idx": part_idx,
+                                                      "sim_id": local_rocket.sim_instance_id} # Add SimID
+                                        network_send_queue.put(
+                                            {"type": network.MSG_TYPE_ACTION, "pid": local_player_id,
+                                             "data": action_msg})  # Send player action
+                                    # print(f"Sent deploy actions for {len(chutes_activated_indices)} chutes.") # Reduce spam
                     if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and can_control_locally:
                         click_world_pos = pygame.math.Vector2(event.pos) + camera.offset
-                        # activate_part_at_pos applies locally AND returns action details
                         action_details = local_rocket.activate_part_at_pos(click_world_pos)
                         if action_details:
-                            # Send the action details over the network
-                            network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id, "data": action_details})
-
-                if not sim_running: break # Exit outer loop if Esc was pressed
-
-                # Continuous Controls (Throttle)
+                            action_details["sim_id"] = local_rocket.sim_instance_id # Add SimID
+                            network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id,
+                                                    "data": action_details})  # Send player action
+                if not sim_running: break
                 if can_control_locally:
-                    keys = pygame.key.get_pressed(); throttle_change = 0.0
+                    keys = pygame.key.get_pressed();
+                    throttle_change = 0.0
                     if keys[pygame.K_w] or keys[pygame.K_UP]: throttle_change += THROTTLE_CHANGE_RATE * dt
                     if keys[pygame.K_s] or keys[pygame.K_DOWN]: throttle_change -= THROTTLE_CHANGE_RATE * dt
-                    if abs(throttle_change) > 1e-6: # Check if change occurred
+                    if abs(throttle_change) > 1e-6:
                         new_throttle = max(0.0, min(1.0, local_rocket.throttle_level + throttle_change))
-                        # Check if throttle value actually changed before sending
                         if abs(new_throttle - local_rocket.throttle_level) > 1e-6:
-                             local_rocket.throttle_level = new_throttle
-                             # Send action immediately
-                             action_msg = {"action": "set_throttle", "value": local_rocket.throttle_level}
-                             network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id, "data": action_msg})
-
+                            local_rocket.throttle_level = new_throttle
+                            action_msg = {"action": "set_throttle", "value": local_rocket.throttle_level,
+                                          "sim_id": local_rocket.sim_instance_id} # Add SimID
+                            network_send_queue.put({"type": network.MSG_TYPE_ACTION, "pid": local_player_id,
+                                                    "data": action_msg})  # Send player action
 
             # --- Update All Active Rockets ---
-            # Create a list of rockets to iterate over, as player_rockets might change during update (splits)
-            current_rockets_in_sim = list(player_rockets.values())
-            for rocket in current_rockets_in_sim:
+            current_rockets_to_update = list(all_sim_rockets)  # Iterate over copy
+            for rocket in current_rockets_to_update:
                 if not rocket.is_active: continue
-                # Skip update if rocket was just created this frame? No, needed for physics.
-                altitude_agl = max(0, GROUND_Y - rocket.get_world_com().y); current_air_density = get_air_density(altitude_agl)
-                # Pass the send queue ONLY to the local rocket's update function
+                altitude_agl = max(0, GROUND_Y - rocket.get_world_com().y);
+                current_air_density = get_air_density(altitude_agl)
                 send_q = network_send_queue if rocket.is_local_player else None
-                rocket.update(dt, current_air_density, particle_manager, network_send_queue=send_q, current_time=current_time)
-                # Check if rocket became inactive or split during its update
+                rocket.update(dt, current_air_density, particle_manager, network_send_queue=send_q,
+                              current_time=current_time)
                 if not rocket.is_active and rocket not in rockets_to_remove_this_frame:
                     rockets_to_remove_this_frame.append(rocket)
-                if rocket.needs_structural_update and rocket.is_active: # Check if update flagged a potential split
-                    # Only host handles split logic authoritatively? Or client predicts?
-                    # Simplest: Host detects split, creates new rockets, broadcasts creation/state.
-                    # Client receives destruction/creation messages.
-                    # For now, let split logic run locally, host will correct if needed.
-                    # We need to track which rocket initiated the split check.
-                    if rocket not in rocket_splits_this_frame:
-                         rocket_splits_this_frame.append(rocket) # Mark for split processing
-
+                # Check if the update call flagged the need for a structural check
+                if rocket.needs_structural_update and rocket.is_active:
+                    if rocket not in rockets_requiring_split_check:
+                        rockets_requiring_split_check.append(rocket)
+                    # Reset flag AFTER adding to check list for this frame
+                    rocket.needs_structural_update = False
 
             # --- Send Queued Network Messages ---
             while not network_send_queue.empty():
                 try:
                     msg_to_send = network_send_queue.get_nowait()
-
-                    # --- FIX: Check if Client or Host ---
+                    # SimID should have been added during input handling if applicable
                     if mp_mode == "CLIENT":
-                        # Client sends messages directly to the server
-                        if not network_mgr.send(msg_to_send):
-                            print("Error: Failed to send message to server.")
-                            # Handle error? Break? Continue?
-
+                        if not network_mgr.send(msg_to_send): print("Error: Failed to send message to server.")
                     elif mp_mode == "HOST":
-                        # Host processes messages from its own local rocket
-                        # These messages need to be broadcast to clients
-
-                        # Ensure host's PID (0) is set correctly
-                        msg_to_send.setdefault("pid", 0)  # Host is player 0
-
-                        # Decide *what* to broadcast based on the message type
+                        msg_to_send.setdefault("pid", 0)  # Host PID is 0
+                        # Convert ACTION to ROCKET_UPDATE before broadcasting for consistency
+                        if msg_to_send.get("type") == network.MSG_TYPE_ACTION:
+                            msg_to_send["type"] = network.MSG_TYPE_ROCKET_UPDATE
+                        # Broadcast relevant messages (updates/state)
                         if msg_to_send.get("type") == network.MSG_TYPE_ROCKET_UPDATE:
-                            # Broadcast the state update as is
                             network_mgr.broadcast(msg_to_send, exclude_socket=None)
-                        elif msg_to_send.get("type") == network.MSG_TYPE_ACTION:
-                            # Convert action to a ROCKET_UPDATE for broadcasting consistency
-                            update_msg = msg_to_send.copy()
-                            update_msg["type"] = network.MSG_TYPE_ROCKET_UPDATE
-                            # Action specific data is already in 'data' field
-                            network_mgr.broadcast(update_msg, exclude_socket=None)
-                        # else: # Handle other message types if host needs to broadcast them?
-                        #     print(f"Host: Ignoring message type {msg_to_send.get('type')} from local send queue.")
-
+                        # else: print(f"Host ignoring local msg type: {msg_to_send.get('type')}")
                 except queue.Empty:
                     break
                 except AttributeError as e:
-                    print(f"Error sending network message (AttributeError): {e} - Check if calling send on Server.")
+                    print(f"Error sending network message (AttributeError): {e}")
                 except Exception as e:
-                    print(f"Error processing send queue: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"Error processing send queue: {e}"); import traceback; traceback.print_exc()
 
             # --- Inter-Rocket Collision (MP) ---
-            # Similar logic to SP, but uses player_rockets dict values
             collision_pairs_processed_this_frame = set()
-            # Get current list of active rockets
-            active_rockets_list = [r for r in player_rockets.values() if r.is_active and r not in rockets_to_remove_this_frame]
+            active_rockets_list = [r for r in all_sim_rockets if r.is_active and r not in rockets_to_remove_this_frame]
             for i in range(len(active_rockets_list)):
-                r1 = active_rockets_list[i]
-                if not r1.parts: continue # Skip if parts somehow disappeared
+                r1 = active_rockets_list[i];
+                if not r1.parts: continue
                 for j in range(i + 1, len(active_rockets_list)):
-                    r2 = active_rockets_list[j]
+                    r2 = active_rockets_list[j];
                     if not r2.parts: continue
-                    # Grace period check
                     pair_key_grace = tuple(sorted((r1.sim_instance_id, r2.sim_instance_id)))
                     if pair_key_grace in collision_grace_period_pairs: continue
-                    # Broad phase
                     dist_sq = (r1.get_world_com() - r2.get_world_com()).length_squared()
-                    r1_r = max(r1.local_bounds.width,r1.local_bounds.height)/2.0; r2_r = max(r2.local_bounds.width,r2.local_bounds.height)/2.0
-                    if dist_sq > (r1_r + r2_r + 10)**2: continue
-                    # Narrow phase
-                    coll_found=False; c_p1=None; c_p2=None
+                    r1_r = max(r1.local_bounds.width, r1.local_bounds.height) / 2.0;
+                    r2_r = max(r2.local_bounds.width, r2.local_bounds.height) / 2.0
+                    if dist_sq > (r1_r + r2_r + 10) ** 2: continue
+                    coll_found = False;
+                    c_p1 = None;
+                    c_p2 = None
                     for p1 in r1.parts:
-                        if p1.is_broken: continue; rect1=r1.get_world_part_aabb(p1)
+                        if p1.is_broken: continue; rect1 = r1.get_world_part_aabb(p1)
                         for p2 in r2.parts:
-                             if p2.is_broken: continue; rect2=r2.get_world_part_aabb(p2)
-                             if rect1.colliderect(rect2): coll_found=True; c_p1=p1; c_p2=p2; break
+                            if p2.is_broken: continue; rect2 = r2.get_world_part_aabb(p2)
+                            if rect1.colliderect(rect2): coll_found = True; c_p1 = p1; c_p2 = p2; break
                         if coll_found: break
-                    # Response
                     if coll_found:
                         pair_key_proc = tuple(sorted((r1.sim_instance_id, r2.sim_instance_id)))
                         if pair_key_proc in collision_pairs_processed_this_frame: continue
                         collision_pairs_processed_this_frame.add(pair_key_proc)
-                        rel_vel = r1.vel - r2.vel; imp_spd = rel_vel.length()
-                        # Apply damage locally (Host might need to broadcast damage state changes?)
-                        r1.apply_collision_damage(imp_spd, particle_manager, c_p1); r2.apply_collision_damage(imp_spd, particle_manager, c_p2)
+                        rel_vel = r1.vel - r2.vel;
+                        imp_spd = rel_vel.length()
+                        # Apply damage locally
+                        r1.apply_collision_damage(imp_spd, particle_manager, c_p1);
+                        r2.apply_collision_damage(imp_spd, particle_manager, c_p2)
                         # Apply push locally
                         coll_norm = r1.get_world_com() - r2.get_world_com()
-                        if coll_norm.length_squared() > 1e-6: coll_norm.normalize_ip()
-                        else: coll_norm = pygame.math.Vector2(0, -1)
-                        push = 2.0; tot_m = r1.total_mass + r2.total_mass
-                        if tot_m > 0.01: r1.pos += coll_norm*push*(r2.total_mass/tot_m); r2.pos -= coll_norm*push*(r1.total_mass/tot_m)
-                        # Check if damage caused structural changes
-                        if r1.needs_structural_update and r1 not in rocket_splits_this_frame: rocket_splits_this_frame.append(r1)
-                        if r2.needs_structural_update and r2 not in rocket_splits_this_frame: rocket_splits_this_frame.append(r2)
+                        if coll_norm.length_squared() > 1e-6:
+                            coll_norm.normalize_ip()
+                        else:
+                            coll_norm = pygame.math.Vector2(0, -1)
+                        push = 2.0;
+                        tot_m = r1.total_mass + r2.total_mass
+                        if tot_m > 0.01: r1.pos += coll_norm * push * (
+                                r2.total_mass / tot_m); r2.pos -= coll_norm * push * (
+                                r1.total_mass / tot_m)
+                        # Flag for split check if damage occurred (handled by update calling handle_destroyed_parts)
 
-            # --- Process Connectivity Checks and Separations (MP) ---
-            # TODO MP: This needs careful handling. Host should be authoritative.
-            # Simplification: Let splits happen locally. Host broadcasts state updates which will eventually correct clients.
-            # More Robust: Only host runs split logic. Sends messages like "ROCKET_DESTROYED", "NEW_ROCKET", "STATE_UPDATE" for fragments.
-            # Implementing the simple local split prediction for now.
-            new_rockets_created_in_split_phase: list[FlyingRocket] = []
-            processed_split_rockets_this_frame = set() # Track sim_instance_ids that already split
+            # --- Process Connectivity Checks and Separations (MP - Local Prediction) ---
+            split_siblings_this_frame: list[FlyingRocket] = []
+            processed_split_rockets_this_frame = set()
 
-            # Iterate through rockets flagged for potential split
-            for rocket in rocket_splits_this_frame:
-                 # Skip if rocket was already removed or already processed for split this frame
-                 if rocket in rockets_to_remove_this_frame or not rocket.is_active or rocket.sim_instance_id in processed_split_rockets_this_frame:
-                     continue
+            for rocket in rockets_requiring_split_check:  # Iterate through rockets flagged earlier
+                if rocket in rockets_to_remove_this_frame or not rocket.is_active or rocket.sim_instance_id in processed_split_rockets_this_frame:
+                    continue
 
-                 processed_split = False; split_siblings: list[FlyingRocket] = []
-                 original_rocket_pid = rocket.player_id # Remember who owned the original rocket
+                # Get separators that were fired this frame for this rocket
+                separators_fired_this_frame = list(rocket.separators_to_fire_this_frame)
+                rocket.separators_to_fire_this_frame.clear()  # Clear the queue
 
-                 # --- Check for splits based on current state (destruction or separation) ---
-                 # We check connectivity based on the *current* parts list (already filtered by handle_destroyed_parts if needed)
-                 # And consider pending separations
-                 parts_to_check = list(rocket.parts)
-                 separators_activated = list(rocket.pending_separation) # Use pending list
-                 rocket.pending_separation.clear() # Clear pending list after copying
+                # Get the current parts list (might have been reduced by damage already)
+                current_parts = list(rocket.parts)
 
-                 # Simulate separator removals first if any activated
-                 split_due_to_separator = False
-                 if separators_activated:
-                      current_check_parts = list(parts_to_check)
-                      for sep_part in separators_activated:
-                           if sep_part not in current_check_parts: continue # Already removed?
-                           parts_without_this_separator = [p for p in current_check_parts if p != sep_part]
-                           temp_bp_sep = RocketBlueprint(); temp_bp_sep.parts = parts_without_this_separator
-                           subassemblies_sep = temp_bp_sep.find_connected_subassemblies()
-                           if len(subassemblies_sep) > 1:
-                                parts_to_check = parts_without_this_separator # Update parts list for subsequent checks
-                                split_due_to_separator = True
-                                # Mark separator as used locally (network state handles actual removal later)
-                                if sep_part in rocket.parts: sep_part.separated = True
-                                break # Handle one separator split at a time per frame? Or just find if *any* split occurs? Assume any split is handled.
-                           else:
-                                # No split from this one, conceptually remove it for next check
-                                current_check_parts = parts_without_this_separator
-                                if sep_part in rocket.parts: sep_part.separated = True # Mark as used
-                      # If a split was found via separator, use the remaining parts for final check
-                      if split_due_to_separator:
-                           parts_to_check = current_check_parts # Use parts remaining after the split-causing separator
+                # Determine the list of parts *if* the fired separators were removed
+                potential_parts_after_separation = [p for p in current_parts if
+                                                    p not in separators_fired_this_frame]
 
-                 # Final connectivity check on potentially modified parts list
-                 temp_bp = RocketBlueprint(); temp_bp.parts = parts_to_check
-                 subassemblies = temp_bp.find_connected_subassemblies()
+                # Check connectivity based on the potential state after separation
+                temp_bp = RocketBlueprint()
+                temp_bp.parts = potential_parts_after_separation  # Check connectivity *without* the fired separators
+                subassemblies = temp_bp.find_connected_subassemblies()
 
-                 # --- Handle Split Creation ---
-                 if len(subassemblies) > 1:
-                      processed_split = True; print(f"[MP:{rocket.sim_instance_id} P:{rocket.player_id}] SPLIT detected into {len(subassemblies)} pieces!")
-                      processed_split_rockets_this_frame.add(rocket.sim_instance_id) # Mark as processed
+                # --- Case 1: Split Detected ---
+                if len(subassemblies) > 1:
+                    processed_split_rockets_this_frame.add(rocket.sim_instance_id)
+                    split_cause = "Separator" if separators_fired_this_frame else "Destruction"
+                    print(
+                        f"[MP:{rocket.sim_instance_id} P:{rocket.player_id}] SPLIT ({split_cause}) into {len(subassemblies)} pieces!")
 
-                      # Mark original for removal
-                      if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(rocket)
+                    if rocket not in rockets_to_remove_this_frame:
+                        rockets_to_remove_this_frame.append(rocket)
 
-                      # Preserve original state if control transfers
-                      original_throttle = rocket.throttle_level; original_master_thrust = rocket.master_thrust_enabled
-                      was_local = rocket.is_local_player
+                    original_throttle = rocket.throttle_level;
+                    original_master_thrust = rocket.master_thrust_enabled
+                    was_local = rocket.is_local_player;
+                    original_pid = rocket.player_id;
+                    original_name = rocket.player_name
+                    current_split_siblings = []
 
-                      # Create new fragments
-                      for assembly_parts in subassemblies:
-                           if not assembly_parts: continue
-                           try:
-                               sub_com_world = rocket.calculate_subassembly_world_com(assembly_parts)
-                               contains_root = rocket.original_root_part_ref and (rocket.original_root_part_ref in assembly_parts)
-                               # Control transfers ONLY if original was local AND this piece has the root
-                               is_primary = was_local and contains_root
-                               # Assign new sim ID
-                               sim_id = next_sim_id_counter; next_sim_id_counter += 1
-                               # Create fragment
-                               # Inherit player ID and name from the original rocket
-                               new_frag = FlyingRocket(list(assembly_parts), sub_com_world, rocket.angle, rocket.vel, sim_id, is_primary, rocket.original_root_part_ref, current_sim_frame, original_rocket_pid, rocket.player_name)
-                               new_frag.angular_velocity = rocket.angular_velocity
-                               if new_frag.is_local_player: new_frag.throttle_level = original_throttle; new_frag.master_thrust_enabled = original_master_thrust
-                               # Apply separation impulse if split by separator? Complex to determine which piece gets which impulse locally.
-                               # Rely on host correction via state updates for now.
+                    for assembly_parts in subassemblies:
+                        if not assembly_parts: continue
+                        try:
+                            sub_com_world = rocket.calculate_subassembly_world_com(assembly_parts)
+                            contains_root = rocket.original_root_part_ref and (
+                                    rocket.original_root_part_ref in assembly_parts)
+                            is_primary = was_local and contains_root
+                            sim_id = next_sim_id_counter;
+                            next_sim_id_counter += 1
+                            new_frag = FlyingRocket(
+                                list(assembly_parts), sub_com_world, rocket.angle, rocket.vel, sim_id,
+                                is_primary,
+                                rocket.original_root_part_ref, current_sim_frame, original_pid,
+                                original_name
+                            )
+                            new_frag.angular_velocity = rocket.angular_velocity
+                            if new_frag.is_local_player:
+                                new_frag.throttle_level = original_throttle;
+                                new_frag.master_thrust_enabled = original_master_thrust
 
-                               new_rockets_created_in_split_phase.append(new_frag)
-                               split_siblings.append(new_frag)
-                               print(f"  > Created fragment SimID:{sim_id} for Player:{original_rocket_pid} (Local:{is_primary})")
+                            if split_cause == "Separator" and separators_fired_this_frame:
+                                sep_world_pos_avg = sum(
+                                    (rocket.get_world_part_center(s) for s in separators_fired_this_frame),
+                                    pygame.math.Vector2()) / len(separators_fired_this_frame)
+                                sep_force = separators_fired_this_frame[0].part_data.get("separation_force",
+                                                                                         1000)
+                                sep_vec = new_frag.get_world_com() - sep_world_pos_avg
+                                if sep_vec.length_squared() > 1e-6:
+                                    sep_dir = sep_vec.normalize()
+                                else:
+                                    sep_dir = pygame.math.Vector2(random.uniform(-1, 1),
+                                                                  random.uniform(-1, 1)).normalize()
+                                impulse_time = 0.05;
+                                impulse_mag = (sep_force / max(0.1, new_frag.total_mass)) * impulse_time
+                                new_frag.vel += sep_dir * impulse_mag;
+                                new_frag.angular_velocity += random.uniform(-15, 15)
 
-                               # --- MP TODO: Host should broadcast creation/state of new fragments ---
-                               # if mp_mode == "HOST":
-                               #    create_msg = {"type": "NEW_ROCKET", ...} network_mgr.broadcast(create_msg)
-                               #    state_msg = {"type": "STATE_UPDATE", ...} network_mgr.broadcast(state_msg)
+                            newly_created_rockets_this_frame.append(new_frag)
+                            current_split_siblings.append(new_frag)
+                            # print(f"  > Created fragment SimID:{sim_id} for Player:{original_pid} (Local:{is_primary})") # Reduce spam
+                            # --- MP TODO: Host should broadcast creation/state of new fragments ---
 
-                           except Exception as e: print(f"Error MP split creation: {e}")
+                        except Exception as e:
+                            print(f"Error MP creating split fragment: {e}")
 
-                 # --- Add Grace Period for New Siblings (MP) ---
-                 if split_siblings:
-                     for i_sib, r_sib1 in enumerate(split_siblings):
-                         for j_sib in range(i_sib + 1, len(split_siblings)):
-                             r_sib2 = split_siblings[j_sib]
-                             grace_pair_key = tuple(sorted((r_sib1.sim_instance_id, r_sib2.sim_instance_id)))
-                             collision_grace_period_pairs[grace_pair_key] = COLLISION_GRACE_FRAMES
-                     split_siblings.clear()
+                    split_siblings_this_frame.extend(current_split_siblings)
 
+                # --- Case 2: No Split, but separators were fired (e.g., end cap) ---
+                elif len(subassemblies) == 1 and separators_fired_this_frame:
+                    # Only modify if separators were the *reason* for the check
+                    print(f"[MP:{rocket.sim_instance_id}] Separator fired but no structural split.")
+                    rocket.parts = potential_parts_after_separation  # Update original rocket's part list
+                    # Rebuild internal component lists and physics properties
+                    rocket.engines = [e for e in rocket.engines if e in rocket.parts]
+                    rocket.fuel_tanks = [t for t in rocket.fuel_tanks if t in rocket.parts]
+                    rocket.parachutes = [pc for pc in rocket.parachutes if pc in rocket.parts]
+                    rocket.separators = [s for s in rocket.separators if s in rocket.parts]
+                    rocket.engine_firing_status = {e: False for e in rocket.engines}
+                    rocket._build_fuel_source_map()
+                    rocket.calculate_physics_properties()
+                    rocket.calculate_bounds()
+                    # Fired separators state handled visually by part.separated = True
+                    if not rocket.parts:  # Check if rocket is now empty
+                        rocket.is_active = False
+                        if rocket not in rockets_to_remove_this_frame: rockets_to_remove_this_frame.append(
+                            rocket)
+
+                # --- Case 3: No Split and no separators fired ---
+                # (Check triggered by damage, but structure held) - No action needed.
+
+            # --- Add Collision Grace Period for New Siblings ---
+            if split_siblings_this_frame:
+                for i_sib, r_sib1 in enumerate(split_siblings_this_frame):
+                    for j_sib in range(i_sib + 1, len(split_siblings_this_frame)):
+                        r_sib2 = split_siblings_this_frame[j_sib]
+                        grace_pair_key = tuple(sorted((r_sib1.sim_instance_id, r_sib2.sim_instance_id)))
+                        collision_grace_period_pairs[grace_pair_key] = COLLISION_GRACE_FRAMES
+                split_siblings_this_frame.clear()
 
             # --- Update Rocket Lists (MP) ---
-            if new_rockets_created_in_split_phase:
-                new_local_rocket = None
-                for new_rocket in new_rockets_created_in_split_phase:
-                     # Add to main dictionary using player ID (fragments keep original PID)
-                     # PROBLEM: Multiple fragments per player ID. Need unique key. Use SimID?
-                     # Let's keep player_rockets keyed by PID for primary rocket, store debris separately?
-                     # Simpler: Keep player_rockets[pid] as the *controlled* rocket for that player. Store others elsewhere?
-                     # Alternative: Modify player_rockets to store a *list* per PID? player_rockets[pid] = [rocket1, rocket2]
-                     # Let's try modifying player_rockets to store lists.
+            if newly_created_rockets_this_frame:
+                new_local_rocket_candidate = None
+                for new_rocket in newly_created_rockets_this_frame:
+                    if new_rocket not in all_sim_rockets:
+                        all_sim_rockets.append(new_rocket)
+                    # Update primary rocket reference if needed
+                    if new_rocket.is_local_player:
+                        new_local_rocket_candidate = new_rocket
+                    # If this fragment belongs to a player who previously had no primary rocket listed, set it
+                    # This logic might need refinement if multiple fragments could be considered 'primary'
+                    elif new_rocket.player_id not in player_rockets:
+                        player_rockets[new_rocket.player_id] = new_rocket
 
-                     pid = new_rocket.player_id
-                     if pid not in player_rockets: # Should not happen if original existed
-                          player_rockets[pid] = [] # Initialize list if needed
+                if new_local_rocket_candidate: # If control transferred to a new fragment
+                    old_local = player_rockets.get(local_player_id)
+                    if old_local and old_local != new_local_rocket_candidate and old_local in all_sim_rockets:
+                         old_local.is_local_player = False # Mark old one non-local if it still exists
+                    player_rockets[local_player_id] = new_local_rocket_candidate # Update primary reference
+                    print(f"Control transferred to new fragment SimID:{new_local_rocket_candidate.sim_instance_id}")
 
-                     # Add the new fragment to the player's list
-                     # Need to rethink how `player_rockets` is used if it becomes a list.
-                     # --- REVERTING: player_rockets holds ONE rocket per PID (the main/controlled one) ---
-                     # Debris needs separate handling or rely on host updates.
-                     # For now, just add to a temporary 'all_sim_rockets' list for drawing/physics?
-
-                     # --- TEMPORARY: Add new fragments directly to player_rockets, overwriting ---
-                     # This is WRONG for multiple fragments, but allows drawing temporarily.
-                     # Needs proper debris management system.
-                     player_rockets[pid] = new_rocket # !!! This overwrites previous fragments !!!
-
-                     if new_rocket.is_local_player: # Check if player regained control
-                          new_local_rocket = new_rocket
-
-                # Update local controlled rocket reference if needed
-                if new_local_rocket:
-                     # If the old controlled rocket still exists but lost control
-                     old_local = player_rockets.get(local_player_id)
-                     if old_local and old_local != new_local_rocket:
-                          old_local.is_local_player = False # Mark old as non-local
-                     # Set the new one as local (already done in FlyingRocket init)
-                     # Update camera target? Done below.
-                     print(f"Control transferred to new fragment SimID:{new_local_rocket.sim_instance_id}")
-
-                new_rockets_created_in_split_phase.clear()
-
+                newly_created_rockets_this_frame.clear()
 
             if rockets_to_remove_this_frame:
-                 # Remove from player_rockets dict
-                 removed_pids = set()
+                 removed_sim_ids = {r.sim_instance_id for r in rockets_to_remove_this_frame}
+                 # Filter main simulation list
+                 all_sim_rockets = [r for r in all_sim_rockets if r.sim_instance_id not in removed_sim_ids]
+                 # Update primary rocket references and handle loss of local control
+                 pids_affected = set(); lost_local_control = False
                  for r in rockets_to_remove_this_frame:
-                      if r.player_id in player_rockets and player_rockets[r.player_id] == r:
-                           del player_rockets[r.player_id]
-                           removed_pids.add(r.player_id)
-                      # Clean up grace period involving removed rockets
-                      removed_sim_id = r.sim_instance_id
-                      pairs_to_del = [p for p in collision_grace_period_pairs if removed_sim_id in p]
-                      for pair in pairs_to_del:
-                           if pair in collision_grace_period_pairs: del collision_grace_period_pairs[pair]
-
-                 # Handle loss of local control
-                 if local_player_id in removed_pids:
-                      print("Local player's rocket was removed.")
-                      # Find if any *new* fragments for local player exist (This is flawed with current overwrite)
-                      # Need a better way to track local player control transfer.
-
+                     pids_affected.add(r.player_id);
+                     if r.is_local_player: lost_local_control = True
+                 for pid in pids_affected:
+                      if pid in player_rockets and player_rockets[pid].sim_instance_id in removed_sim_ids:
+                           # Find a replacement primary rocket for this player if one exists
+                           replacement = next((rkt for rkt in all_sim_rockets if rkt.player_id == pid and rkt.is_active and rkt.original_root_part_ref and rkt.original_root_part_ref in rkt.parts and not rkt.original_root_part_ref.is_broken), None)
+                           if replacement:
+                                player_rockets[pid] = replacement
+                                if pid == local_player_id: # If it was the local player losing primary
+                                     replacement.is_local_player = True; lost_local_control = False
+                                     print(f"Control transferred to replacement SimID {replacement.sim_instance_id}.")
+                           else:
+                                if pid in player_rockets: del player_rockets[pid] # Check existence before deleting
+                                if pid == local_player_id: print("Lost control: No suitable replacement found.")
+                 # Clean grace period
+                 pairs_to_del = [p for p in collision_grace_period_pairs if p[0] in removed_sim_ids or p[1] in removed_sim_ids]
+                 for pair in pairs_to_del:
+                      if pair in collision_grace_period_pairs: del collision_grace_period_pairs[pair]
                  rockets_to_remove_this_frame.clear()
 
             # --- Camera Update (MP) ---
             local_rocket = player_rockets.get(local_player_id)
-            if local_rocket and local_rocket.is_active:
-                 camera.update(local_rocket.get_world_com())
-            elif player_rockets: # Fallback to follow first active rocket if local is gone
-                 first_active = next((r for r in player_rockets.values() if r.is_active), None)
+            if local_rocket and local_rocket.is_active: camera.update(local_rocket.get_world_com())
+            elif all_sim_rockets: # Fallback to follow first active rocket
+                 first_active = next((r for r in all_sim_rockets if r.is_active), None)
                  if first_active: camera.update(first_active.get_world_com())
-            # Else camera stays put
 
             # --- Periodic Ping (Client) ---
             if mp_mode == "CLIENT" and current_time - last_ping_time > 5.0:
-                 network_mgr.send({"type": network.MSG_TYPE_PING})
-                 last_ping_time = current_time
+                 network_mgr.send({"type": network.MSG_TYPE_PING}); last_ping_time = current_time
 
         # --- Drawing ---
-        screen.fill(BLACK)
-        # Draw background elements based on camera position (local player's view)
-        draw_earth_background(screen, camera, stars); draw_terrain(screen, camera)
-
-        # Draw all active rockets (from player_rockets dictionary)
+        screen.fill(BLACK); draw_earth_background(screen, camera, stars); draw_terrain(screen, camera)
         total_parts_drawn = 0; total_broken_drawn = 0
-        # Sort rockets by Y pos for pseudo-depth? Or just draw all.
-        all_rockets_to_draw = list(player_rockets.values()) # Get current rockets
-        for rocket in all_rockets_to_draw:
+        for rocket in all_sim_rockets: # Draw all rockets from the simulation list
             if rocket.is_active:
-                # Draw name tag for all rockets in MP
                 broken_count = rocket.draw(screen, camera, particle_manager, draw_name=True)
                 total_parts_drawn += len(rocket.parts); total_broken_drawn += broken_count
-
-        # Draw particles
         particle_manager.update(dt); particle_manager.draw(screen, camera)
 
         # --- Draw UI (MP) ---
-        # Status text during WAITING phase
         if current_phase == "WAITING":
-             status_lines = ["Waiting for Players..."]
-             for pid, name in connected_players.items():
-                  bp_status = "OK" if pid in player_blueprints else "Waiting"
-                  rdy_status = "Ready" if player_ready_status.get(pid, False) else "Not Ready"
-                  local_tag = "(You)" if pid == local_player_id else ""
-                  status_lines.append(f" - P{pid} {name} {local_tag}: Blueprint[{bp_status}] Status[{rdy_status}]")
-             y_pos = 50
-             for line in status_lines:
-                  surf = ui_font_large.render(line, True, WHITE)
-                  rect = surf.get_rect(center=(SCREEN_WIDTH // 2, y_pos))
-                  screen.blit(surf, rect)
-                  y_pos += 40
-
-        # Draw telemetry for local player during RUNNING phase
+            # ... (Waiting UI drawing) ...
+            status_lines = ["Waiting for Players..."]; y_pos = 50
+            for pid, name in connected_players.items():
+                 bp_status = "OK" if pid in player_blueprints else "Waiting"; rdy_status = "Ready" if player_ready_status.get(pid, False) else "Not Ready"
+                 local_tag = "(You)" if pid == local_player_id else ""
+                 status_lines.append(f" - P{pid} {name} {local_tag}: Blueprint[{bp_status}] Status[{rdy_status}]")
+            for line in status_lines: surf = ui_font_large.render(line, True, WHITE); rect = surf.get_rect(center=(SCREEN_WIDTH // 2, y_pos)); screen.blit(surf, rect); y_pos += 40
         elif current_phase == "RUNNING":
-            local_rocket = player_rockets.get(local_player_id)
-            if local_rocket: # Draw local player UI if their rocket exists
-                # Throttle Bar
-                bar_w=20; bar_h=100; bar_x=15; bar_y=SCREEN_HEIGHT-bar_h-40
-                pygame.draw.rect(screen, COLOR_UI_BAR_BG, (bar_x, bar_y, bar_w, bar_h))
-                fill_h = bar_h * local_rocket.throttle_level; pygame.draw.rect(screen, COLOR_UI_BAR, (bar_x, bar_y + bar_h - fill_h, bar_w, fill_h))
-                pygame.draw.rect(screen, WHITE, (bar_x, bar_y, bar_w, bar_h), 1)
-                th_label=ui_font.render("Thr",True,WHITE); screen.blit(th_label, (bar_x, bar_y + bar_h + 5))
-                th_value=ui_font.render(f"{local_rocket.throttle_level*100:.0f}%",True,WHITE); screen.blit(th_value, (bar_x, bar_y - 18))
-                # Telemetry
-                alt_agl = max(0, GROUND_Y - local_rocket.get_lowest_point_world().y); alt_msl = GROUND_Y - local_rocket.get_world_com().y
-                root_ref = local_rocket.original_root_part_ref # Check local control status
-                can_control = local_rocket.is_local_player and root_ref and root_ref in local_rocket.parts and not root_ref.is_broken
-                ctrl_status = "OK" if can_control else "NO CTRL"
-                thrust_status = "ON" if local_rocket.master_thrust_enabled else "OFF"; landed_status = "LANDED" if local_rocket.landed else "FLYING"
-                max_temp_k = local_rocket.max_temp_reading; temp_color = WHITE; hottest_allowable = DEFAULT_MAX_TEMP
-                if local_rocket.parts: temps = [p.part_data.get('max_temp',DEFAULT_MAX_TEMP) for p in local_rocket.parts if p.part_data]; hottest_allowable = max(temps) if temps else DEFAULT_MAX_TEMP
-                if max_temp_k > REENTRY_EFFECT_THRESHOLD_TEMP: temp_color = (255,255,0)
-                if max_temp_k > hottest_allowable * 0.9: temp_color = (255,100,0)
+            local_rocket_ref = player_rockets.get(local_player_id) # Get current primary reference
+            if local_rocket_ref and local_rocket_ref in all_sim_rockets and local_rocket_ref.is_active: # Check it's still valid & in sim
+                 # ... (Local player telemetry UI drawing using local_rocket_ref) ...
+                bar_w = 20; bar_h = 100; bar_x = 15; bar_y = SCREEN_HEIGHT - bar_h - 40
+                pygame.draw.rect(screen, COLOR_UI_BAR_BG, (bar_x, bar_y, bar_w, bar_h)); fill_h = bar_h * local_rocket_ref.throttle_level; pygame.draw.rect(screen, COLOR_UI_BAR, (bar_x, bar_y + bar_h - fill_h, bar_w, fill_h))
+                pygame.draw.rect(screen, WHITE, (bar_x, bar_y, bar_w, bar_h), 1); th_label = ui_font.render("Thr",True,WHITE); screen.blit(th_label, (bar_x, bar_y + bar_h + 5)); th_value = ui_font.render(f"{local_rocket_ref.throttle_level*100:.0f}%",True,WHITE); screen.blit(th_value, (bar_x, bar_y - 18))
+                alt_agl = max(0, GROUND_Y - local_rocket_ref.get_lowest_point_world().y); alt_msl = GROUND_Y - local_rocket_ref.get_world_com().y
+                root_ref = local_rocket_ref.original_root_part_ref; can_control = local_rocket_ref.is_local_player and root_ref and root_ref in local_rocket_ref.parts and not root_ref.is_broken
+                ctrl_status = "OK" if can_control else "NO CTRL"; thrust_status = "ON" if local_rocket_ref.master_thrust_enabled else "OFF"; landed_status = "LANDED" if local_rocket_ref.landed else "FLYING"
+                max_temp_k = local_rocket_ref.max_temp_reading; temp_color = WHITE; hottest_allowable = DEFAULT_MAX_TEMP
+                if local_rocket_ref.parts: temps = [p.part_data.get('max_temp',DEFAULT_MAX_TEMP) for p in local_rocket_ref.parts if p.part_data]; hottest_allowable = max(temps) if temps else DEFAULT_MAX_TEMP
+                if max_temp_k > REENTRY_EFFECT_THRESHOLD_TEMP: temp_color = (255,255,0);
+                if max_temp_k > hottest_allowable * 0.9: temp_color = (255,100,0);
                 if max_temp_k > hottest_allowable: temp_color = RED
-                total_fuel = local_rocket.get_total_current_fuel()
-                status_texts = [f"Alt(AGL): {alt_agl:.1f}m", f"Alt(MSL): {alt_msl:.1f}m", f"Vvel: {local_rocket.vel.y:.1f} m/s", f"Hvel: {local_rocket.vel.x:.1f} m/s",
-                                f"Speed: {local_rocket.vel.length():.1f} m/s", f"Angle: {local_rocket.angle:.1f} deg", f"AngVel: {local_rocket.angular_velocity:.1f} d/s",
-                                f"Thr: {local_rocket.throttle_level*100:.0f}% [{thrust_status}]", f"Fuel: {total_fuel:.1f} units", f"Mass: {local_rocket.total_mass:.1f} kg",
-                                f"Control: {ctrl_status}", f"Status: {landed_status}"] #, f"MaxTemp: {max_temp_k:.0f} K"]
+                total_fuel = local_rocket_ref.get_total_current_fuel()
+                status_texts = [f"Alt(AGL): {alt_agl:.1f}m", f"Alt(MSL): {alt_msl:.1f}m", f"Vvel: {local_rocket_ref.vel.y:.1f} m/s", f"Hvel: {local_rocket_ref.vel.x:.1f} m/s", f"Speed: {local_rocket_ref.vel.length():.1f} m/s", f"Angle: {local_rocket_ref.angle:.1f} deg", f"AngVel: {local_rocket_ref.angular_velocity:.1f} d/s", f"Thr: {local_rocket_ref.throttle_level*100:.0f}% [{thrust_status}]", f"Fuel: {total_fuel:.1f} units", f"Mass: {local_rocket_ref.total_mass:.1f} kg", f"Control: {ctrl_status}", f"Status: {landed_status}"]
                 text_y_start = 10; control_color = WHITE if can_control else RED
-                for i, text in enumerate(status_texts):
-                    line_color = temp_color if "MaxTemp" in text else (control_color if "Control" in text else WHITE)
-                    text_surf = ui_font.render(text, True, line_color); screen.blit(text_surf, (bar_x + bar_w + 10, text_y_start + i * 18))
+                for i, text in enumerate(status_texts): line_color = temp_color if "MaxTemp" in text else (control_color if "Control" in text else WHITE); text_surf = ui_font.render(text, True, line_color); screen.blit(text_surf, (bar_x + bar_w + 10, text_y_start + i * 18))
                 temp_surf = ui_font.render(f"MaxTemp: {max_temp_k:.0f} K", True, temp_color); screen.blit(temp_surf, (bar_x + bar_w + 10, text_y_start + len(status_texts) * 18))
+            else: # Local player has no active primary rocket
+                 destroyed_text = ui_font_large.render("LOCAL CONTROL LOST",True,RED); text_rect = destroyed_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)); screen.blit(destroyed_text,text_rect)
 
-            else: # Local rocket destroyed or not found
-                 destroyed_text=ui_font_large.render("LOCAL ROCKET LOST",True,RED); text_rect=destroyed_text.get_rect(center=(SCREEN_WIDTH//2, SCREEN_HEIGHT//2)); screen.blit(destroyed_text,text_rect)
-
-
-        # Debug Info (MP)
-        fps = clock.get_fps(); debug_y = 10; debug_x = SCREEN_WIDTH - 140 # Move left slightly
+        # --- Debug Info (MP) ---
+        fps = clock.get_fps(); debug_y = 10; debug_x = SCREEN_WIDTH - 140
         fps_text = ui_font.render(f"FPS: {fps:.1f}", True, WHITE); screen.blit(fps_text, (debug_x, debug_y)); debug_y += 18
         mode_text = ui_font.render(f"Mode: {mp_mode}", True, WHITE); screen.blit(mode_text, (debug_x, debug_y)); debug_y += 18
         pid_text = ui_font.render(f"PID: {local_player_id}", True, WHITE); screen.blit(pid_text, (debug_x, debug_y)); debug_y += 18
-        rocket_count = len(player_rockets) # Count entries in the dict
-        obj_text = ui_font.render(f"Tracked: {rocket_count}", True, WHITE); screen.blit(obj_text, (debug_x, debug_y)); debug_y += 18
+        rocket_count = len(all_sim_rockets) # Count all active rockets/debris
+        obj_text = ui_font.render(f"Sim Rkts: {rocket_count}", True, WHITE); screen.blit(obj_text, (debug_x, debug_y)); debug_y += 18
         parts_text = ui_font.render(f"Parts: {total_parts_drawn}", True, WHITE); screen.blit(parts_text, (debug_x, debug_y)); debug_y += 18
         particle_text = ui_font.render(f"Particles: {len(particle_manager.particles)}", True, WHITE); screen.blit(particle_text, (debug_x, debug_y)); debug_y += 18
         grace_text = ui_font.render(f"Grace Pairs: {len(collision_grace_period_pairs)}", True, WHITE); screen.blit(grace_text, (debug_x, debug_y)); debug_y += 18
         phase_text = ui_font.render(f"Phase: {current_phase}", True, WHITE); screen.blit(phase_text, (debug_x, debug_y)); debug_y += 18
+        conn_text = ui_font.render(f"Connected: {len(connected_players)}", True, WHITE); screen.blit(conn_text, (debug_x, debug_y)); debug_y += 18
 
 
         pygame.display.flip() # Update Display
 
     print(f"--- Exiting Simulation (Multiplayer {mp_mode}) ---")
     # Network cleanup happens in main.py after this function returns
-
 
 # --- Direct Run Logic (for testing SP, unchanged) ---
 if __name__ == '__main__':
